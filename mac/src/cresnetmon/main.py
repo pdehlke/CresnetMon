@@ -1,16 +1,17 @@
 """Entry point for the CresnetMon macOS app.
 
-Currently a stub: opens an empty window. UI, serial I/O, and protocol
-parsing are wired in by later tasks (see ../STRATEGY.md).
+Builds the UI shell (cresnetmon.ui.CresnetMonWindow) with default no-op
+callbacks. Wiring to serial_io/protocol happens in task 5; see STRATEGY.md.
 """
 
 import tkinter as tk
 
+from cresnetmon.ui import CresnetMonWindow
+
 
 def main() -> None:
     root = tk.Tk()
-    root.title("Cresnet Monitor")
-    root.geometry("640x400")
+    CresnetMonWindow(root)
     root.mainloop()
 
 
