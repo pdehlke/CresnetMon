@@ -177,10 +177,17 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    of failing silently (`OpenPort`'s original was `Debug.WriteLine`-only).
    End-to-end smoke-tested against the real FT232R adapter (start/stop
    cycle). (`7dedd91`)
-6. → **Persistence** — window geometry + last port/device-id saved to
+6. ✅ **Persistence** — window geometry + last port/device-id saved to
    `~/Library/Application Support/CresnetMon/config.json`, restored on
-   launch (replaces `FormSettings.cs`).
-7. **Packaging** — `pyinstaller` spec (or `py2app`) to produce a `.app`
+   launch (replaces `FormSettings.cs`). New `config.py`; `app.py` loads on
+   init and saves on `WM_DELETE_WINDOW`; `ui.py` gained
+   `initial_port`/`initial_device_id` ctor params. One `# fmt: skip` needed
+   - ruff format under `target-version = "py314"` wants to strip parens
+   off multi-exception `except` clauses into the new bracketless 3.14
+   syntax; kept parens for readability per this user's Python conventions.
+   Verified end-to-end against the real config path (save on close,
+   restored on next launch), test artifact removed after. (`2f90c3e`)
+7. → **Packaging** — `pyinstaller` spec (or `py2app`) to produce a `.app`
    bundle; icon; smoke-test launch from Finder.
 8. **End-to-end test + polish** — script that feeds a known byte sequence
    into the serial layer (loopback or mock port) and diffs displayed rows
