@@ -14,6 +14,7 @@ from datetime import datetime
 from tkinter import messagebox
 
 from cresnetmon import config
+from cresnetmon.devices import format_device_label, load_seed
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick, ProtocolEvent
 from cresnetmon.serial_io import PortOpenError, SerialReader, open_port
 from cresnetmon.ui import CresnetMonWindow
@@ -51,6 +52,7 @@ class CresnetMonApp:
         self._device_filter = 0
         self._running = False
         self._settings = config.load()
+        self._devices = load_seed()
 
         self.window = CresnetMonWindow(
             root,
@@ -149,7 +151,7 @@ class CresnetMonApp:
         if self._device_filter != 0 and event.dev_id != self._device_filter:
             return
         time_str = datetime.now().strftime("%H:%M:%S")
-        dev_str = f"{event.dev_id:02X}"
+        dev_str = format_device_label(event.dev_id, self._devices)
         sent = "" if event.to_master else event.text
         received = event.text if event.to_master else ""
         self.window.add_row(event.cycle, time_str, dev_str, sent, received)

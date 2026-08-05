@@ -1,0 +1,23 @@
+{
+  "source": "homeassistant repo's crestron-migration.md (REPORTCRESNET output + program .dsc room map), captured 2026-08-04. Hand-copied, no live sync - see mac/STRATEGY.md's \"Seed device map\" section.",
+  "devices": [
+    {"id": "0x02", "model": "MC2E", "room": "Living Room AV Cabinet"},
+    {"id": "0x62", "model": "CNX-B8", "room": "Master Bedroom"},
+    {"id": "0x66", "model": "CNX-B8", "room": "Master Bedroom"},
+    {"id": "0x63", "model": "CNX-B8", "room": "Outdoor Kitchen"},
+    {"id": "0x64", "model": "CNX-B8", "room": "Kitchen"},
+    {"id": "0x6F", "model": "CNX-B8", "room": "Kitchen"},
+    {"id": "0x65", "model": "CNX-B8", "room": "Master Bathroom"},
+    {"id": "0x67", "model": "CNX-B8", "room": "Foyer"},
+    {"id": "0x6A", "model": "CNX-B8", "room": "Great Room"},
+    {"id": "0x6D", "model": "CNX-B8", "room": "Studio"},
+    {"id": "0x70", "model": "CLX-1DIM8", "room": "Garage"},
+    {"id": "0x71", "model": "CLX-1DIM8", "room": "Garage"},
+    {"id": "0x72", "model": "CLX-1DIM8", "room": "Garage"},
+    {"id": "0x73", "model": "CLX-1DIM4", "room": "Garage"},
+    {"id": "0x75", "model": "CLX-1DIM4", "room": "Garage"},
+    {"id": "0x76", "model": "CLX-1DIM4", "room": "Garage"},
+    {"id": "0x74", "model": "CLX-4HSW4", "room": "Garage"},
+    {"id": "0x0A", "model": "ST-IO", "room": "Living Room AV Cabinet"}
+  ]
+}
