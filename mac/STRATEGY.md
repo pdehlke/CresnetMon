@@ -160,12 +160,16 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    `tests/test_serial_io.py`; also smoke-tested against a real USB-RS485
    FT232R adapter (open/close only, no live bus available at test time).
    (`dba5010`)
-4. → **UI shell** — window, port dropdown + refresh, device-id entry,
+4. ✅ **UI shell** — window, port dropdown + refresh, device-id entry,
    start/stop/clear buttons, `ttk.Treeview` (Cycle, Time, Dev, Sent,
-   Received columns), status bar (polling count).
-5. **Wire UI to serial+protocol** — start/stop handlers, queue polling into
-   Treeview rows, hex device-id parsing/validation with error dialog on bad
-   input or port-open failure.
+   Received columns), status bar (polling count). `ui.py`'s
+   `CresnetMonWindow` takes Start/Clear as pluggable no-op-by-default
+   callbacks; `main.py` now launches it for real instead of the task-1
+   stub. Port refresh is wired live (`serial_io.list_ports()`), since
+   that's read-only enumeration, not a task-5 concern. (`c31e112`)
+5. → **Wire UI to serial+protocol** — start/stop handlers, queue polling
+   into Treeview rows, hex device-id parsing/validation with error dialog
+   on bad input or port-open failure.
 6. **Persistence** — window geometry + last port/device-id saved to
    `~/Library/Application Support/CresnetMon/config.json`, restored on
    launch (replaces `FormSettings.cs`).
