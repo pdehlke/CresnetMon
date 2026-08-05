@@ -1,17 +1,13 @@
-"""Entry point for the CresnetMon macOS app.
-
-Builds the UI shell (cresnetmon.ui.CresnetMonWindow) with default no-op
-callbacks. Wiring to serial_io/protocol happens in task 5; see STRATEGY.md.
-"""
+"""Entry point for the CresnetMon macOS app."""
 
 import tkinter as tk
 
-from cresnetmon.ui import CresnetMonWindow
+from cresnetmon.app import CresnetMonApp
 
 
 def main() -> None:
     root = tk.Tk()
-    CresnetMonWindow(root)
+    CresnetMonApp(root)
     root.mainloop()
 
 
