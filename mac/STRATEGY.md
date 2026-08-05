@@ -22,7 +22,8 @@ mac/
     __init__.py
     protocol.py      # pure state machine, no I/O
     serial_io.py      # port enumeration + background reader thread
-    ui.py              # tkinter/ttk app
+    ui.py              # tkinter/ttk app (pure UI, no serial/protocol deps)
+    app.py             # wires ui.py to serial_io.py + protocol.py
     config.py          # window geometry / last-used settings persistence
     main.py            # entry point
   tests/
@@ -167,10 +168,16 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    callbacks; `main.py` now launches it for real instead of the task-1
    stub. Port refresh is wired live (`serial_io.list_ports()`), since
    that's read-only enumeration, not a task-5 concern. (`c31e112`)
-5. → **Wire UI to serial+protocol** — start/stop handlers, queue polling
+5. ✅ **Wire UI to serial+protocol** — start/stop handlers, queue polling
    into Treeview rows, hex device-id parsing/validation with error dialog
-   on bad input or port-open failure.
-6. **Persistence** — window geometry + last port/device-id saved to
+   on bad input or port-open failure. New `app.py`/`CresnetMonApp` (not in
+   the original file list above - added since ui.py deliberately has no
+   serial/protocol deps and something has to own the wiring). Deviation
+   from the original: a failed port open now shows an error dialog instead
+   of failing silently (`OpenPort`'s original was `Debug.WriteLine`-only).
+   End-to-end smoke-tested against the real FT232R adapter (start/stop
+   cycle). (`7dedd91`)
+6. → **Persistence** — window geometry + last port/device-id saved to
    `~/Library/Application Support/CresnetMon/config.json`, restored on
    launch (replaces `FormSettings.cs`).
 7. **Packaging** — `pyinstaller` spec (or `py2app`) to produce a `.app`
