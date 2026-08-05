@@ -210,10 +210,17 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    macOS port). Tasks 9-12 (below) are the labeling/capture mode from the
    "Labeling / capture mode" design section - a second phase, not yet
    started.
-9. → **Burst/capture grouping** — pure logic layer above `protocol.py`
+9. ✅ **Burst/capture grouping** — pure logic layer above `protocol.py`
    (no I/O): groups `Message` events into bursts per the silence-window
    rule above, ignoring `PollTick`. Own tests, synthetic event sequences.
-10. **Seed device map** — `mac/seed/devices.json` hand-copied from
+   New `burst.py`/`BurstGrouper`: `feed()` opens/extends a window on each
+   `Message`, `check()` (caller-driven, not internal) closes it on a
+   silence timeout. Timestamps are caller-supplied floats, not wall-clock
+   reads, so tests are synthetic/deterministic - no real sleeps. Caller
+   contract (check() needs roughly the same cadence as feed()) documented
+   in the class docstring for whoever wires this into the UI in task 11.
+   (`d726a64`)
+10. → **Seed device map** — `mac/seed/devices.json` hand-copied from
     `crestron-migration.md`'s `REPORTCRESNET` tables, plus a loader; wire
     into the plain live view so rows show human labels instead of raw hex.
 11. **Labeling UI** — Arm/Disarm button (enabled only while running), label
