@@ -25,5 +25,17 @@ uv sync
 uv run python -m cresnetmon.main
 ```
 
+## Build a standalone .app
+
+```
+uv sync --group packaging
+uv run --group packaging pyinstaller build_app.spec --noconfirm
+open dist/CresnetMon.app
+```
+
+Produces `dist/CresnetMon.app` (~29MB, onedir build), double-click-launchable
+from Finder, no Python install required on the target Mac. No custom icon
+yet (uses the PyInstaller/macOS default) - deferred, see `STRATEGY.md`.
+
 Status: work in progress — see `STRATEGY.md` for the task breakdown and
 current state.

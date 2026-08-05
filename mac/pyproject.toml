@@ -19,6 +19,9 @@ dev = [
     "ruff>=0.15",
     "pytest>=9",
 ]
+packaging = [
+    "pyinstaller>=6.11",
+]
 
 [tool.ruff]
 src = ["src"]
