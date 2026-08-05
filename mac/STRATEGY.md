@@ -194,10 +194,23 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    follow-up nice-to-have, not a blocker. Built (~29MB) and smoke-tested
    via `open dist/CresnetMon.app` (same path Finder's double-click takes);
    confirmed running via `ps`/System Events, killed cleanly. (`5ed8431`)
-8. → **End-to-end test + polish** — script that feeds a known byte sequence
+8. ✅ **End-to-end test + polish** — script that feeds a known byte sequence
    into the serial layer (loopback or mock port) and diffs displayed rows
    against expected output; update mac README with usage instructions.
-9. **Burst/capture grouping** — pure logic layer above `protocol.py`
+   `tests/test_end_to_end.py` drives the real stack (fake port only) top to
+   bottom via `CresnetMonApp`, both unfiltered and device-filtered. Found
+   and fixed a wrong hand-traced expectation this way (send-id carries
+   over from the last non-master address seen, not "whichever device the
+   message concerns") - instrumented `CresnetProtocol` directly instead of
+   re-guessing. README gained Usage/Development sections; also caught and
+   fixed the labeling-mode paragraph reading as already-built when it's
+   still just designed. (`04c6e8f`)
+
+   This closes out the original 8-task plan (a working, packaged, tested
+   macOS port). Tasks 9-12 (below) are the labeling/capture mode from the
+   "Labeling / capture mode" design section - a second phase, not yet
+   started.
+9. → **Burst/capture grouping** — pure logic layer above `protocol.py`
    (no I/O): groups `Message` events into bursts per the silence-window
    rule above, ignoring `PollTick`. Own tests, synthetic event sequences.
 10. **Seed device map** — `mac/seed/devices.json` hand-copied from
