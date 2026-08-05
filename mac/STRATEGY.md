@@ -144,14 +144,23 @@ automation constructor, the `.jsonl` file is copied into the `homeassistant`
 repo by hand.
 
 ## Task breakdown (~1 hour each)
-1. **Scaffold** — dir/package structure above, `requirements.txt`
+
+Status key: ✅ done, → next up. Resuming in a fresh session: read this file
+top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
+
+1. ✅ **Scaffold** — dir/package structure above, `requirements.txt`
    (`pyserial`), stub `main.py` that opens an empty window, mac README.
-2. **Protocol module + tests** — `protocol.py` pure translation of
+   (`879b6f3`)
+2. ✅ **Protocol module + tests** — `protocol.py` pure translation of
    `CresNetProcessByte`/`ShowMessage`; `tests/test_protocol.py` feeding
    synthetic byte sequences, asserting emitted messages/ids match expected.
-3. **Serial layer** — port listing, open/close, background reader thread
-   feeding `protocol.py`, thread-safe message queue.
-4. **UI shell** — window, port dropdown + refresh, device-id entry,
+   (`922afbb`)
+3. ✅ **Serial layer** — port listing, open/close, background reader thread
+   feeding `protocol.py`, thread-safe message queue. `serial_io.py` +
+   `tests/test_serial_io.py`; also smoke-tested against a real USB-RS485
+   FT232R adapter (open/close only, no live bus available at test time).
+   (`dba5010`)
+4. → **UI shell** — window, port dropdown + refresh, device-id entry,
    start/stop/clear buttons, `ttk.Treeview` (Cycle, Time, Dev, Sent,
    Received columns), status bar (polling count).
 5. **Wire UI to serial+protocol** — start/stop handlers, queue polling into
