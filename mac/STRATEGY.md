@@ -16,9 +16,9 @@ translated line-for-line, not redesigned — it works, no reason to touch it.
 ```
 mac/
   STRATEGY.md
-  requirements.txt
+  pyproject.toml   # uv + hatchling, deps: pyserial (dev: ruff, pytest)
   README.md
-  cresnetmon/
+  src/cresnetmon/
     __init__.py
     protocol.py      # pure state machine, no I/O
     serial_io.py      # port enumeration + background reader thread
@@ -28,6 +28,8 @@ mac/
   tests/
     test_protocol.py
 ```
+Package management is `uv` (`uv sync`, `uv run ...`), per this user's standing
+Python conventions — not `pip`/`venv`.
 
 ## Protocol notes (for task 2)
 - States: `Searching → Ready → Addressed → Payload` (`MainForm.cs:29-35`)
