@@ -187,9 +187,14 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    syntax; kept parens for readability per this user's Python conventions.
    Verified end-to-end against the real config path (save on close,
    restored on next launch), test artifact removed after. (`2f90c3e`)
-7. → **Packaging** — `pyinstaller` spec (or `py2app`) to produce a `.app`
-   bundle; icon; smoke-test launch from Finder.
-8. **End-to-end test + polish** — script that feeds a known byte sequence
+7. ✅ **Packaging** — `pyinstaller` spec (or `py2app`) to produce a `.app`
+   bundle; icon; smoke-test launch from Finder. `build_app.spec`, onedir,
+   windowed, new `packaging` dependency group (separate from `dev`,
+   build-time only). No custom icon yet - uses the default, deferred as a
+   follow-up nice-to-have, not a blocker. Built (~29MB) and smoke-tested
+   via `open dist/CresnetMon.app` (same path Finder's double-click takes);
+   confirmed running via `ps`/System Events, killed cleanly. (`5ed8431`)
+8. → **End-to-end test + polish** — script that feeds a known byte sequence
    into the serial layer (loopback or mock port) and diffs displayed rows
    against expected output; update mac README with usage instructions.
 9. **Burst/capture grouping** — pure logic layer above `protocol.py`
