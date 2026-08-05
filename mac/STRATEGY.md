@@ -220,10 +220,17 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
    contract (check() needs roughly the same cadence as feed()) documented
    in the class docstring for whoever wires this into the UI in task 11.
    (`d726a64`)
-10. → **Seed device map** — `mac/seed/devices.json` hand-copied from
+10. ✅ **Seed device map** — `mac/seed/devices.json` hand-copied from
     `crestron-migration.md`'s `REPORTCRESNET` tables, plus a loader; wire
     into the plain live view so rows show human labels instead of raw hex.
-11. **Labeling UI** — Arm/Disarm button (enabled only while running), label
+    18 devices (1 MC2E, 9 keypads, 7 lighting modules, 1 ST-IO); excludes
+    the two confirmed-dead stale thermostat definitions. New `devices.py`
+    (`load_seed()`, `format_device_label()`); `app.py`'s Dev column now
+    shows e.g. `"67 Foyer keypad"` for known ids, plain hex otherwise -
+    existing tests needed zero changes since their fixture ids aren't in
+    the seed. Not yet in the PyInstaller bundle's data files - flagged for
+    whoever rebuilds it once labeling mode needs packaging. (`4b444d5`)
+11. → **Labeling UI** — Arm/Disarm button (enabled only while running), label
     dialog (device dropdown, button/action text, optional note), auto-rearm
     on submit.
 12. **JSONL capture writer** — `mac/captures/<timestamp>.jsonl`, append one
