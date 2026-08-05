@@ -42,6 +42,8 @@ class CresnetMonWindow:
         on_start_stop: Callable[[], None] | None = None,
         on_clear: Callable[[], None] | None = None,
         on_refresh_ports: Callable[[], None] | None = None,
+        initial_port: str = "",
+        initial_device_id: str = "",
     ) -> None:
         self.root = root
         self._on_start_stop = on_start_stop or (lambda: None)
@@ -51,8 +53,8 @@ class CresnetMonWindow:
         root.title("Cresnet Monitor")
         root.geometry("640x400")
 
-        self.port_var = tk.StringVar()
-        self.device_id_var = tk.StringVar()
+        self.port_var = tk.StringVar(value=initial_port)
+        self.device_id_var = tk.StringVar(value=initial_device_id)
         self.status_var = tk.StringVar(value="Polling count: 0")
 
         self._build_widgets()

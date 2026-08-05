@@ -11,8 +11,10 @@ from collections.abc import Iterator
 
 import pytest
 
+from cresnetmon import config as config_module
 from cresnetmon.app import APP_TITLE, CresnetMonApp, DeviceIdError, parse_device_id
 from cresnetmon.protocol import CresnetProtocol
+from cresnetmon.serial_io import SerialReader
 
 
 class _FakePort:
@@ -162,3 +164,44 @@ def test_clear_resets_counter_and_keeps_poll_reference_while_running(
     assert app._protocol.msg_count == 0
     assert app.window.status_var.get() == "Polling count: 0"
     assert len(app.window.results.get_children()) == 0
+
+
+def test_app_restores_saved_port_and_device_id(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    monkeypatch.setattr(
+        "cresnetmon.config.load",
+        lambda: config_module.Settings(device_id="0A", com_port="/dev/cu.usbserial-X"),
+    )
+
+    app = CresnetMonApp(root)
+
+    assert app.window.device_id_var.get() == "0A"
+    assert app.window.port_var.get() == "/dev/cu.usbserial-X"
+
+
+def test_on_close_persists_settings_and_stops_running_reader(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    monkeypatch.setattr("cresnetmon.config.load", lambda: config_module.Settings())
+    saved: list[config_module.Settings] = []
+    monkeypatch.setattr("cresnetmon.config.save", saved.append)
+    monkeypatch.setattr(root, "destroy", lambda: None)
+
+    app = CresnetMonApp(root)
+    fake_port = _FakePort()
+    app._reader = SerialReader(fake_port, app._protocol)
+    app._reader.start()
+    app._running = True
+    app.window.device_id_var.set("0A")
+    app.window.port_var.set("/dev/cu.usbserial-X")
+
+    app._on_close()
+
+    assert fake_port.is_open is False
+    assert app._reader is None
+    assert len(saved) == 1
+    assert saved[0].device_id == "0A"
+    assert saved[0].com_port == "/dev/cu.usbserial-X"

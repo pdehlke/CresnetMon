@@ -1,16 +1,19 @@
-"""Wires the UI shell to the serial/protocol layers.
+"""Wires the UI shell to the serial/protocol/config layers.
 
-The only module that knows about all three of ui.py, serial_io.py, and
-protocol.py: start/stop handling, device-id filter parsing, error dialogs,
-and draining the SerialReader's event queue into Treeview rows via
+The only module that knows about ui.py, serial_io.py, protocol.py, and
+config.py together: start/stop handling, device-id filter parsing, error
+dialogs, draining the SerialReader's event queue into Treeview rows via
 tk.after() polling (tkinter isn't thread-safe; the reader thread only ever
-touches the queue).
+touches the queue), and restoring/persisting window geometry plus
+last-used port/device-id across launches.
 """
 
 import tkinter as tk
+from dataclasses import replace
 from datetime import datetime
 from tkinter import messagebox
 
+from cresnetmon import config
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick, ProtocolEvent
 from cresnetmon.serial_io import PortOpenError, SerialReader, open_port
 from cresnetmon.ui import CresnetMonWindow
@@ -47,12 +50,35 @@ class CresnetMonApp:
         self._reader: SerialReader | None = None
         self._device_filter = 0
         self._running = False
+        self._settings = config.load()
 
         self.window = CresnetMonWindow(
             root,
             on_start_stop=self._on_start_stop,
             on_clear=self._on_clear,
+            initial_port=self._settings.com_port,
+            initial_device_id=self._settings.device_id,
         )
+        # Applied after CresnetMonWindow's own default-geometry call, so a
+        # saved size/position wins over the built-in 640x400 default.
+        config.apply_to_window(self._settings, root)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        """Mirrors MainForm_FormClosing (MainForm.cs:247-256): close the
+        port if running, then persist geometry plus the current port and
+        device-id fields."""
+        if self._reader is not None:
+            self._reader.stop()
+            self._reader = None
+        settings = config.capture_from_window(self._settings, self.window.root)
+        settings = replace(
+            settings,
+            device_id=self.window.device_id_var.get(),
+            com_port=self.window.port_var.get(),
+        )
+        config.save(settings)
+        self.window.root.destroy()
 
     def _on_start_stop(self) -> None:
         if self._running:
