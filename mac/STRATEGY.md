@@ -230,10 +230,21 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
     existing tests needed zero changes since their fixture ids aren't in
     the seed. Not yet in the PyInstaller bundle's data files - flagged for
     whoever rebuilds it once labeling mode needs packaging. (`4b444d5`)
-11. → **Labeling UI** — Arm/Disarm button (enabled only while running), label
+11. ✅ **Labeling UI** — Arm/Disarm button (enabled only while running), label
     dialog (device dropdown, button/action text, optional note), auto-rearm
-    on submit.
-12. **JSONL capture writer** — `mac/captures/<timestamp>.jsonl`, append one
+    on submit. New `ui.LabelDialog` (modal, pure UI - opaque value/label
+    pairs in, callback out); `app.py` owns a `BurstGrouper` + armed state,
+    feeds every drained event to it while armed, checks it every polling
+    tick. A closed burst pauses arming and opens the dialog (device
+    options = seed map + any burst device id not already in it, default =
+    first device seen); submit/cancel both auto-rearm unless Stop happened
+    meanwhile; Stop always disarms and discards any open burst.
+    `_on_label_submitted()` is a deliberate no-op stub - task 12's seam.
+    Caught two real bugs via tests: `LabelDialog`'s value/label dict built
+    backwards (submit sent the display label, not the device id), and an
+    Arm-button test invoking it while still disabled (ttk buttons don't
+    fire disabled). (`d4410ec`)
+12. → **JSONL capture writer** — `mac/captures/<timestamp>.jsonl`, append one
     record per labeled burst, flushed immediately; wire to the labeling UI.
 
 Tasks are sequential (2 depends on 1; 3-6 depend on 2; 7-8 depend on the
