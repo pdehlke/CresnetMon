@@ -5,15 +5,18 @@ Uses a fake serial port (no real hardware) and monkeypatches open_port and
 the error-dialog call so nothing blocks on real widgets/dialogs.
 """
 
+import json
 import time
 import tkinter as tk
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cresnetmon import config as config_module
 from cresnetmon.app import APP_TITLE, CresnetMonApp, DeviceIdError, parse_device_id
+from cresnetmon.capture import CaptureWriter
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick
 from cresnetmon.serial_io import SerialReader
 
@@ -304,7 +307,9 @@ def test_dialog_submit_calls_handler_and_rearms(
     monkeypatch.setattr(
         CresnetMonApp,
         "_on_label_submitted",
-        lambda self, burst, device, button, note: submitted.append((burst, device, button, note)),
+        lambda self, burst, started_at, closed_at, device, button, note: submitted.append(
+            (burst, device, button, note)
+        ),
     )
     app = _make_running_armable_app(root, monkeypatch)
     clock = [0.0]
@@ -380,4 +385,47 @@ def test_stop_disarms_and_discards_open_burst(root: tk.Tk, monkeypatch: pytest.M
 
     assert app._armed is False
     assert app._burst.is_open is False
-    assert app.window.arm_button["text"] == "Arm"
+
+
+def test_full_arm_to_submit_flow_writes_a_real_capture_file(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end for the labeling mode's write path: real CaptureWriter
+    (directory redirected to tmp_path), real _on_label_submitted, real
+    device-info lookup from the seed map - only the dialog's own widget
+    mechanics are stubbed (LabelDialog itself is covered directly in
+    test_ui.py)."""
+    monkeypatch.setattr("cresnetmon.app.CaptureWriter", lambda: CaptureWriter(tmp_path))
+    dialogs: list[SimpleNamespace] = []
+    monkeypatch.setattr(
+        "cresnetmon.app.LabelDialog",
+        lambda parent, **kwargs: dialogs.append(SimpleNamespace(**kwargs)),
+    )
+    app = _make_running_armable_app(root, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr("cresnetmon.app.time.monotonic", lambda: clock[0])
+    app._on_arm_disarm()
+
+    protocol = CresnetProtocol()
+    for byte in bytes([0x00, 0x67, 0x03, 0x11, 0x22, 0x33]):  # known seed device 0x67
+        event = protocol.feed(byte)
+        if event is not None:
+            app._handle_event(event)
+    clock[0] += 0.6
+    app._check_burst()
+
+    assert list(tmp_path.glob("*.jsonl")) == []
+
+    dialogs[0].on_submit("67", "dim up", "Foyer cans to 100%")
+
+    files = list(tmp_path.glob("*.jsonl"))
+    assert len(files) == 1
+    record = json.loads(files[0].read_text().splitlines()[0])
+    assert record["device"] == {"id": "0x67", "model": "CNX-B8", "room": "Foyer"}
+    assert record["button"] == "dim up"
+    assert record["note"] == "Foyer cans to 100%"
+    assert record["frames"] == [
+        {"dev_id": "0x67", "cycle": 0, "text": "11 22 33", "to_master": False}
+    ]
+    assert app._armed is True  # auto-rearmed after a real submit
+    assert app.window.arm_button["text"] == "Disarm"

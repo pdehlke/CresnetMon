@@ -1,13 +1,13 @@
-"""Wires the UI shell to the serial/protocol/config/burst layers.
+"""Wires the UI shell to the serial/protocol/config/burst/capture layers.
 
 The only module that knows about ui.py, serial_io.py, protocol.py,
-config.py, devices.py, and burst.py together: start/stop handling,
-device-id filter parsing, error dialogs, draining the SerialReader's event
-queue into Treeview rows via tk.after() polling (tkinter isn't
-thread-safe; the reader thread only ever touches the queue),
-restoring/persisting window geometry plus last-used port/device-id across
-launches, and the labeling/capture mode's arm/burst/dialog flow
-(STRATEGY.md's "Labeling / capture mode" section).
+config.py, devices.py, burst.py, and capture.py together: start/stop
+handling, device-id filter parsing, error dialogs, draining the
+SerialReader's event queue into Treeview rows via tk.after() polling
+(tkinter isn't thread-safe; the reader thread only ever touches the
+queue), restoring/persisting window geometry plus last-used port/
+device-id across launches, and the labeling/capture mode's arm/burst/
+dialog/write flow (STRATEGY.md's "Labeling / capture mode" section).
 """
 
 import time
@@ -18,6 +18,7 @@ from tkinter import messagebox
 
 from cresnetmon import config
 from cresnetmon.burst import Burst, BurstGrouper
+from cresnetmon.capture import CaptureWriter
 from cresnetmon.devices import format_device_label, load_seed
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick, ProtocolEvent
 from cresnetmon.serial_io import PortOpenError, SerialReader, open_port
@@ -59,6 +60,8 @@ class CresnetMonApp:
         self._devices = load_seed()
         self._burst = BurstGrouper()
         self._armed = False
+        self._burst_started_wall: datetime | None = None
+        self._capture_writer: CaptureWriter | None = None
 
         self.window = CresnetMonWindow(
             root,
@@ -154,7 +157,10 @@ class CresnetMonApp:
 
     def _handle_event(self, event: ProtocolEvent) -> None:
         if self._armed:
+            was_open = self._burst.is_open
             self._burst.feed(event, time.monotonic())
+            if not was_open and self._burst.is_open:
+                self._burst_started_wall = datetime.now()
         if isinstance(event, PollTick):
             self.window.set_status(event.cycle)
             return
@@ -181,9 +187,11 @@ class CresnetMonApp:
         burst = self._burst.check(time.monotonic())
         if burst is None:
             return
+        closed_at = datetime.now()
+        started_at = self._burst_started_wall or closed_at
         self._armed = False
         self.window.set_armed(armed=False)
-        self._show_label_dialog(burst)
+        self._show_label_dialog(burst, started_at, closed_at)
 
     def _device_options(self, burst: Burst) -> list[tuple[str, str]]:
         """(hex-id, display-label) pairs for the label dialog's device
@@ -202,7 +210,7 @@ class CresnetMonApp:
                 known_ids.add(dev_id_str)
         return options
 
-    def _show_label_dialog(self, burst: Burst) -> None:
+    def _show_label_dialog(self, burst: Burst, started_at: datetime, closed_at: datetime) -> None:
         """Prompts for the burst's label, per STRATEGY.md's "Label schema".
         Default device selection is whichever device id appeared first in
         the burst, matching the design doc."""
@@ -212,7 +220,7 @@ class CresnetMonApp:
         default_label = by_value.get(default_value, default_value)
 
         def on_submit(device_value: str, button_text: str, note: str) -> None:
-            self._on_label_submitted(burst, device_value, button_text, note)
+            self._on_label_submitted(burst, started_at, closed_at, device_value, button_text, note)
             self._rearm()
 
         LabelDialog(
@@ -233,6 +241,29 @@ class CresnetMonApp:
         self.window.set_armed(armed=True)
 
     def _on_label_submitted(
-        self, burst: Burst, device_value: str, button_text: str, note: str
+        self,
+        burst: Burst,
+        started_at: datetime,
+        closed_at: datetime,
+        device_value: str,
+        button_text: str,
+        note: str,
     ) -> None:
-        """Seam for task 12's JSONL writer - not persisted yet."""
+        """Writes the labeled burst to this session's JSONL capture file
+        (mac/captures/*.jsonl), per STRATEGY.md's "Output" section."""
+        info = self._devices.get(int(device_value, 16))
+        device = {
+            "id": f"0x{device_value}",
+            "model": info.model if info else None,
+            "room": info.room if info else None,
+        }
+        if self._capture_writer is None:
+            self._capture_writer = CaptureWriter()
+        self._capture_writer.write(
+            burst,
+            started_at=started_at,
+            closed_at=closed_at,
+            device=device,
+            button=button_text,
+            note=note,
+        )
