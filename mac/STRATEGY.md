@@ -244,8 +244,32 @@ top to bottom, then start at →. Each ✅ item names the commit(s) that did it.
     backwards (submit sent the display label, not the device id), and an
     Arm-button test invoking it while still disabled (ttk buttons don't
     fire disabled). (`d4410ec`)
-12. → **JSONL capture writer** — `mac/captures/<timestamp>.jsonl`, append one
+12. ✅ **JSONL capture writer** — `mac/captures/<timestamp>.jsonl`, append one
     record per labeled burst, flushed immediately; wire to the labeling UI.
+    New `capture.CaptureWriter` (opens/writes/closes fresh each call, no
+    held-open handle); record shape matches the design doc's example
+    exactly. `app.py` tracks burst wall-clock bounds separately from
+    `BurstGrouper`'s deliberately-monotonic timestamps (captured at the
+    moment a burst opens/closes, not at submit time - the dialog can sit
+    open for a while), fills in task 11's `_on_label_submitted()` stub:
+    seed-map lookup, lazy one-writer-per-launch, write. Caught a wrong
+    hand-trace again writing the end-to-end test (`to_master` for a
+    non-master dest id is `False`, not `True` - checked `protocol.py`
+    instead of re-guessing) and a copy-paste assertion contradicting
+    itself. (`5e43296`)
+
+**All 12 tasks done.** The macOS port (tasks 1-8) and the labeling/capture
+mode (tasks 9-12) are both fully built and tested. 82 tests, ruff clean.
+Real end-to-end verified outside the test suite too: a real `CresnetMonApp`
+armed, a real `LabelDialog`'s real Submit button clicked, a real file
+landed in `mac/captures/` with the expected content.
+
+Next, if picked back up: nothing is required for the tool to be usable as
+built. Possible follow-ups noted along the way and not yet done: a custom
+`.app` icon (task 7), bundling the seed JSON as PyInstaller data so
+labeling mode works in the packaged `.app` (task 10), and copying a
+finished `.jsonl` capture into the `homeassistant` repo once its
+automation constructor exists to consume one.
 
 Tasks are sequential (2 depends on 1; 3-6 depend on 2; 7-8 depend on the
 rest) but 2 is independently testable/valuable without hardware or a GUI —
