@@ -1,23 +1,27 @@
-"""Wires the UI shell to the serial/protocol/config layers.
+"""Wires the UI shell to the serial/protocol/config/burst layers.
 
-The only module that knows about ui.py, serial_io.py, protocol.py, and
-config.py together: start/stop handling, device-id filter parsing, error
-dialogs, draining the SerialReader's event queue into Treeview rows via
-tk.after() polling (tkinter isn't thread-safe; the reader thread only ever
-touches the queue), and restoring/persisting window geometry plus
-last-used port/device-id across launches.
+The only module that knows about ui.py, serial_io.py, protocol.py,
+config.py, devices.py, and burst.py together: start/stop handling,
+device-id filter parsing, error dialogs, draining the SerialReader's event
+queue into Treeview rows via tk.after() polling (tkinter isn't
+thread-safe; the reader thread only ever touches the queue),
+restoring/persisting window geometry plus last-used port/device-id across
+launches, and the labeling/capture mode's arm/burst/dialog flow
+(STRATEGY.md's "Labeling / capture mode" section).
 """
 
+import time
 import tkinter as tk
 from dataclasses import replace
 from datetime import datetime
 from tkinter import messagebox
 
 from cresnetmon import config
+from cresnetmon.burst import Burst, BurstGrouper
 from cresnetmon.devices import format_device_label, load_seed
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick, ProtocolEvent
 from cresnetmon.serial_io import PortOpenError, SerialReader, open_port
-from cresnetmon.ui import CresnetMonWindow
+from cresnetmon.ui import CresnetMonWindow, LabelDialog
 
 APP_TITLE = "Cresnet Monitor"
 POLL_INTERVAL_MS = 50
@@ -53,11 +57,14 @@ class CresnetMonApp:
         self._running = False
         self._settings = config.load()
         self._devices = load_seed()
+        self._burst = BurstGrouper()
+        self._armed = False
 
         self.window = CresnetMonWindow(
             root,
             on_start_stop=self._on_start_stop,
             on_clear=self._on_clear,
+            on_arm_disarm=self._on_arm_disarm,
             initial_port=self._settings.com_port,
             initial_device_id=self._settings.device_id,
         )
@@ -113,13 +120,18 @@ class CresnetMonApp:
         self._poll_events()
 
     def _stop(self) -> None:
-        """Mirrors btnStart_Click's stop branch (MainForm.cs:265-270)."""
+        """Mirrors btnStart_Click's stop branch (MainForm.cs:265-270).
+        Also disarms - labeling needs a live bus, and any burst already in
+        progress is discarded rather than left to time out later."""
         if self._reader is not None:
             self._drain_events(self._reader)  # pick up any last events
             self._reader.stop()
             self._reader = None
         self._running = False
         self.window.set_running(running=False)
+        self._armed = False
+        self._burst.reset()
+        self.window.set_armed(armed=False)
 
     def _on_clear(self) -> None:
         """Mirrors btnClear_Click (MainForm.cs:292-298): counter always
@@ -131,6 +143,8 @@ class CresnetMonApp:
     def _poll_events(self) -> None:
         if self._reader is not None:
             self._drain_events(self._reader)
+        if self._armed:
+            self._check_burst()
         if self._running:
             self.window.root.after(POLL_INTERVAL_MS, self._poll_events)
 
@@ -139,6 +153,8 @@ class CresnetMonApp:
             self._handle_event(reader.events.get_nowait())
 
     def _handle_event(self, event: ProtocolEvent) -> None:
+        if self._armed:
+            self._burst.feed(event, time.monotonic())
         if isinstance(event, PollTick):
             self.window.set_status(event.cycle)
             return
@@ -155,3 +171,68 @@ class CresnetMonApp:
         sent = "" if event.to_master else event.text
         received = event.text if event.to_master else ""
         self.window.add_row(event.cycle, time_str, dev_str, sent, received)
+
+    def _on_arm_disarm(self) -> None:
+        self._armed = not self._armed
+        self._burst.reset()
+        self.window.set_armed(armed=self._armed)
+
+    def _check_burst(self) -> None:
+        burst = self._burst.check(time.monotonic())
+        if burst is None:
+            return
+        self._armed = False
+        self.window.set_armed(armed=False)
+        self._show_label_dialog(burst)
+
+    def _device_options(self, burst: Burst) -> list[tuple[str, str]]:
+        """(hex-id, display-label) pairs for the label dialog's device
+        dropdown: every seeded device, plus any device id that showed up
+        in this burst but isn't in the seed (shown as plain hex so it's
+        still selectable/identifiable)."""
+        options = [
+            (f"{dev_id:02X}", format_device_label(dev_id, self._devices))
+            for dev_id in sorted(self._devices)
+        ]
+        known_ids = {value for value, _label in options}
+        for message in burst.messages:
+            dev_id_str = f"{message.dev_id:02X}"
+            if dev_id_str not in known_ids:
+                options.append((dev_id_str, dev_id_str))
+                known_ids.add(dev_id_str)
+        return options
+
+    def _show_label_dialog(self, burst: Burst) -> None:
+        """Prompts for the burst's label, per STRATEGY.md's "Label schema".
+        Default device selection is whichever device id appeared first in
+        the burst, matching the design doc."""
+        options = self._device_options(burst)
+        by_value = dict(options)
+        default_value = f"{burst.messages[0].dev_id:02X}" if burst.messages else ""
+        default_label = by_value.get(default_value, default_value)
+
+        def on_submit(device_value: str, button_text: str, note: str) -> None:
+            self._on_label_submitted(burst, device_value, button_text, note)
+            self._rearm()
+
+        LabelDialog(
+            self.window.root,
+            device_options=options,
+            default_label=default_label,
+            on_submit=on_submit,
+            on_cancel=self._rearm,
+        )
+
+    def _rearm(self) -> None:
+        """Auto-rearm after a label is submitted or cancelled, unless
+        monitoring has since been stopped (STRATEGY.md: submitting
+        auto-rearms; Stop always disarms - see _stop())."""
+        if not self._running:
+            return
+        self._armed = True
+        self.window.set_armed(armed=True)
+
+    def _on_label_submitted(
+        self, burst: Burst, device_value: str, button_text: str, note: str
+    ) -> None:
+        """Seam for task 12's JSONL writer - not persisted yet."""

@@ -10,7 +10,7 @@ from collections.abc import Iterator
 import pytest
 
 from cresnetmon.serial_io import PortInfo
-from cresnetmon.ui import CresnetMonWindow
+from cresnetmon.ui import CresnetMonWindow, LabelDialog
 
 
 @pytest.fixture
@@ -60,6 +60,43 @@ def test_set_running_toggles_button_and_disables_inputs(
     assert str(window.device_id_entry["state"]) == "normal"
 
 
+def test_arm_button_starts_disabled_and_follows_running_state(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    window = CresnetMonWindow(root)
+
+    assert str(window.arm_button["state"]) == "disabled"
+
+    window.set_running(running=True)
+    assert str(window.arm_button["state"]) == "normal"
+
+    window.set_running(running=False)
+    assert str(window.arm_button["state"]) == "disabled"
+
+
+def test_set_armed_toggles_arm_button_text(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    window = CresnetMonWindow(root)
+
+    window.set_armed(armed=True)
+    assert window.arm_button["text"] == "Disarm"
+
+    window.set_armed(armed=False)
+    assert window.arm_button["text"] == "Arm"
+
+
+def test_arm_disarm_callback_invoked(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    calls = []
+    window = CresnetMonWindow(root, on_arm_disarm=lambda: calls.append(1))
+    window.set_running(running=True)  # Arm is disabled (see test above) until running
+
+    window.arm_button.invoke()
+
+    assert calls == [1]
+
+
 def test_add_row_and_clear_rows(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
     window = CresnetMonWindow(root)
@@ -95,3 +132,62 @@ def test_start_stop_and_clear_callbacks_invoked(
     window.clear_button.invoke()
 
     assert calls == {"start_stop": 1, "clear": 1}
+
+
+def test_label_dialog_submit_passes_device_value_not_label(root: tk.Tk) -> None:
+    submitted = []
+    dialog = LabelDialog(
+        root,
+        device_options=[("67", "67 Foyer keypad"), ("70", "70 Garage dimmer")],
+        default_label="67 Foyer keypad",
+        on_submit=lambda device, button, note: submitted.append((device, button, note)),
+        on_cancel=lambda: None,
+    )
+    assert dialog.device_var.get() == "67 Foyer keypad"
+
+    dialog.button_var.set("dim up")
+    dialog.note_var.set("Foyer cans to 100%")
+    top = dialog.top
+    dialog.submit_button.invoke()
+
+    assert submitted == [("67", "dim up", "Foyer cans to 100%")]
+    assert not top.winfo_exists()
+
+
+def test_label_dialog_cancel_invokes_callback_without_submit(root: tk.Tk) -> None:
+    submitted = []
+    cancelled = []
+    dialog = LabelDialog(
+        root,
+        device_options=[("67", "67 Foyer keypad")],
+        default_label="67 Foyer keypad",
+        on_submit=lambda device, button, note: submitted.append((device, button, note)),
+        on_cancel=lambda: cancelled.append(1),
+    )
+    top = dialog.top
+
+    # WM_DELETE_WINDOW is bound to _cancel (module docstring: closing the
+    # window counts as Cancel); calling it directly exercises the same
+    # path a real close-button click would take.
+    dialog._cancel()
+
+    assert submitted == []
+    assert cancelled == [1]
+    assert not top.winfo_exists()
+
+
+def test_label_dialog_unlisted_device_falls_back_to_label_as_value(root: tk.Tk) -> None:
+    """A device id present in the burst but absent from the seed map is
+    passed through as both value and label (app.py's _device_options)."""
+    submitted = []
+    dialog = LabelDialog(
+        root,
+        device_options=[("99", "99")],
+        default_label="99",
+        on_submit=lambda device, button, note: submitted.append(device),
+        on_cancel=lambda: None,
+    )
+
+    dialog.submit_button.invoke()
+
+    assert submitted == ["99"]

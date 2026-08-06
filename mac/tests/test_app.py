@@ -8,12 +8,13 @@ the error-dialog call so nothing blocks on real widgets/dialogs.
 import time
 import tkinter as tk
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
 from cresnetmon import config as config_module
 from cresnetmon.app import APP_TITLE, CresnetMonApp, DeviceIdError, parse_device_id
-from cresnetmon.protocol import CresnetProtocol
+from cresnetmon.protocol import CresnetProtocol, Message, PollTick
 from cresnetmon.serial_io import SerialReader
 
 
@@ -205,3 +206,178 @@ def test_on_close_persists_settings_and_stops_running_reader(
     assert len(saved) == 1
     assert saved[0].device_id == "0A"
     assert saved[0].com_port == "/dev/cu.usbserial-X"
+
+
+def _make_running_armable_app(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> CresnetMonApp:
+    """CresnetMonApp with running=True but no real reader/serial port -
+    Arm/burst/dialog logic doesn't need one, only _running being true."""
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    app = CresnetMonApp(root)
+    app._running = True
+    app.window.set_running(running=True)
+    return app
+
+
+def test_arm_disarm_toggles_state_button_and_resets_burst(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _make_running_armable_app(root, monkeypatch)
+    app._burst.feed(Message(cycle=1, text="AA", dev_id=0x05, to_master=True), now=0.0)
+    assert app._burst.is_open is True
+
+    app.window.arm_button.invoke()  # arm
+    assert app._armed is True
+    assert app.window.arm_button["text"] == "Disarm"
+    assert app._burst.is_open is False  # arming resets any stale burst
+
+    app.window.arm_button.invoke()  # disarm
+    assert app._armed is False
+    assert app.window.arm_button["text"] == "Arm"
+
+
+def test_poll_tick_while_armed_does_not_open_a_burst(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _make_running_armable_app(root, monkeypatch)
+    app._on_arm_disarm()  # arm
+
+    app._handle_event(PollTick(cycle=1))
+
+    assert app._burst.is_open is False
+
+
+def test_burst_silence_timeout_opens_dialog_with_expected_defaults(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dialogs: list[SimpleNamespace] = []
+
+    def fake_dialog(
+        parent: object,
+        *,
+        device_options: object,
+        default_label: object,
+        on_submit: object,
+        on_cancel: object,
+    ) -> None:
+        dialogs.append(
+            SimpleNamespace(
+                parent=parent,
+                device_options=device_options,
+                default_label=default_label,
+                on_submit=on_submit,
+                on_cancel=on_cancel,
+            )
+        )
+
+    monkeypatch.setattr("cresnetmon.app.LabelDialog", fake_dialog)
+    app = _make_running_armable_app(root, monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr("cresnetmon.app.time.monotonic", lambda: clock[0])
+    app._on_arm_disarm()  # arm
+
+    protocol = CresnetProtocol()
+    for byte in bytes([0x00, 0x67, 0x03, 0x11, 0x22, 0x33]):  # message from seeded device 0x67
+        event = protocol.feed(byte)
+        if event is not None:
+            app._handle_event(event)
+
+    assert dialogs == []  # not yet past the silence window
+    clock[0] += 0.6
+    app._check_burst()
+
+    assert len(dialogs) == 1
+    assert dialogs[0].default_label == "67 Foyer keypad"
+    assert ("67", "67 Foyer keypad") in dialogs[0].device_options
+    assert app._armed is False  # paused while the dialog is "open"
+    assert app.window.arm_button["text"] == "Arm"
+
+
+def test_dialog_submit_calls_handler_and_rearms(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dialogs: list[SimpleNamespace] = []
+    monkeypatch.setattr(
+        "cresnetmon.app.LabelDialog",
+        lambda parent, **kwargs: dialogs.append(SimpleNamespace(**kwargs)),
+    )
+    submitted: list[tuple[object, str, str, str]] = []
+    monkeypatch.setattr(
+        CresnetMonApp,
+        "_on_label_submitted",
+        lambda self, burst, device, button, note: submitted.append((burst, device, button, note)),
+    )
+    app = _make_running_armable_app(root, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr("cresnetmon.app.time.monotonic", lambda: clock[0])
+    app._on_arm_disarm()
+    protocol = CresnetProtocol()
+    for byte in bytes([0x00, 0x67, 0x03, 0x11, 0x22, 0x33]):
+        event = protocol.feed(byte)
+        if event is not None:
+            app._handle_event(event)
+    clock[0] += 0.6
+    app._check_burst()
+    dialog = dialogs[0]
+
+    dialog.on_submit("67", "dim up", "Foyer cans to 100%")
+
+    assert len(submitted) == 1
+    burst, device, button, note = submitted[0]
+    assert (device, button, note) == ("67", "dim up", "Foyer cans to 100%")
+    assert burst.messages[0].text == "11 22 33"
+    assert app._armed is True  # auto-rearmed
+    assert app.window.arm_button["text"] == "Disarm"
+
+
+def test_dialog_cancel_rearms_without_calling_handler(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dialogs: list[SimpleNamespace] = []
+    monkeypatch.setattr(
+        "cresnetmon.app.LabelDialog",
+        lambda parent, **kwargs: dialogs.append(SimpleNamespace(**kwargs)),
+    )
+    submitted: list[object] = []
+    monkeypatch.setattr(CresnetMonApp, "_on_label_submitted", lambda self, *a: submitted.append(a))
+    app = _make_running_armable_app(root, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr("cresnetmon.app.time.monotonic", lambda: clock[0])
+    app._on_arm_disarm()
+    protocol = CresnetProtocol()
+    for byte in bytes([0x00, 0x67, 0x03, 0x11, 0x22, 0x33]):
+        event = protocol.feed(byte)
+        if event is not None:
+            app._handle_event(event)
+    clock[0] += 0.6
+    app._check_burst()
+
+    dialogs[0].on_cancel()
+
+    assert submitted == []
+    assert app._armed is True  # still auto-rearms on cancel
+
+
+def test_rearm_is_noop_if_monitoring_stopped_meanwhile(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _make_running_armable_app(root, monkeypatch)
+    app._on_arm_disarm()
+    app._armed = False  # simulate a dialog having just paused arming
+    app._running = False  # ...and Stop was clicked while it was open
+
+    app._rearm()
+
+    assert app._armed is False
+
+
+def test_stop_disarms_and_discards_open_burst(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
+    app = _make_running_armable_app(root, monkeypatch)
+    app._on_arm_disarm()
+    app._burst.feed(Message(cycle=1, text="AA", dev_id=0x05, to_master=True), now=0.0)
+    assert app._burst.is_open is True
+
+    app._stop()
+
+    assert app._armed is False
+    assert app._burst.is_open is False
+    assert app.window.arm_button["text"] == "Arm"

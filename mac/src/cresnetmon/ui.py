@@ -1,13 +1,16 @@
 """Tkinter/ttk UI shell for CresnetMon.
 
 Pure UI construction and layout - no serial I/O or protocol parsing here
-beyond enumerating ports for the dropdown. Start/Stop/Clear are pluggable
-callbacks (constructor params, default no-ops) so this module has no
-dependency on serial_io.SerialReader/protocol.CresnetProtocol; task 5 wires
-real behavior in without touching layout code.
+beyond enumerating ports for the dropdown. Start/Stop/Clear/Arm are
+pluggable callbacks (constructor params, default no-ops) so this module
+has no dependency on serial_io.SerialReader/protocol.CresnetProtocol/
+burst.BurstGrouper; app.py wires real behavior in without touching layout
+code.
 
 Mirrors the widget set in MainForm.Designer.cs: selComPort, txtDeviceId,
-btnStart, btnClear, viewResults (ListView -> ttk.Treeview), statusText.
+btnStart, btnClear, viewResults (ListView -> ttk.Treeview), statusText. The
+Arm button and LabelDialog have no original-app equivalent - new for the
+labeling/capture mode (STRATEGY.md).
 """
 
 import tkinter as tk
@@ -42,6 +45,7 @@ class CresnetMonWindow:
         on_start_stop: Callable[[], None] | None = None,
         on_clear: Callable[[], None] | None = None,
         on_refresh_ports: Callable[[], None] | None = None,
+        on_arm_disarm: Callable[[], None] | None = None,
         initial_port: str = "",
         initial_device_id: str = "",
     ) -> None:
@@ -49,6 +53,7 @@ class CresnetMonWindow:
         self._on_start_stop = on_start_stop or (lambda: None)
         self._on_clear = on_clear or (lambda: None)
         self._on_refresh_ports = on_refresh_ports or self._default_refresh_ports
+        self._on_arm_disarm = on_arm_disarm or (lambda: None)
 
         root.title("Cresnet Monitor")
         root.geometry("640x400")
@@ -80,6 +85,10 @@ class CresnetMonWindow:
         self.clear_button = ttk.Button(top, text="Clear", command=self._on_clear)
         self.clear_button.pack(side=tk.LEFT)
 
+        self.arm_button = ttk.Button(top, text="Arm", command=self._on_arm_disarm)
+        self.arm_button.configure(state=tk.DISABLED)
+        self.arm_button.pack(side=tk.LEFT, padx=(12, 0))
+
         self.results = ttk.Treeview(self.root, columns=COLUMNS, show="headings")
         for col in COLUMNS:
             self.results.heading(col, text=COLUMN_HEADINGS[col])
@@ -107,10 +116,19 @@ class CresnetMonWindow:
 
     def set_running(self, *, running: bool) -> None:
         """Toggle widget state/labels for start/stop, mirroring
-        btnStart_Click's UI updates (MainForm.cs:263-290)."""
+        btnStart_Click's UI updates (MainForm.cs:263-290). Arm is only
+        ever clickable while running - labeling needs a live bus."""
         self.start_button.configure(text="Stop" if running else "Start")
         self.port_combo.configure(state=tk.DISABLED if running else "readonly")
         self.device_id_entry.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.arm_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+
+    def set_armed(self, *, armed: bool) -> None:
+        """Toggle the Arm/Disarm label. Separate from set_running() since
+        the caller (app.py) tracks armed state independently of run state -
+        e.g. it resets this to False on Stop without necessarily going
+        through a user click on this button."""
+        self.arm_button.configure(text="Disarm" if armed else "Arm")
 
     def add_row(self, cycle: int, time_str: str, dev_id_str: str, sent: str, received: str) -> None:
         """Append one row to the results view (mirrors DisplayMessage,
@@ -124,3 +142,79 @@ class CresnetMonWindow:
     def set_status(self, msg_count: int) -> None:
         """Mirrors ShowStatus (MainForm.cs:113-116)."""
         self.status_var.set(f"Polling count: {msg_count}")
+
+
+class LabelDialog:
+    """Modal dialog prompting for one burst's label: device, button/action
+    text, and an optional note - per STRATEGY.md's "Label schema".
+
+    Pure UI: the caller supplies device choices as opaque (value,
+    display-text) pairs and gets the submitted values back through
+    `on_submit`; this class has no idea what a Burst or a Cresnet device
+    id is. Closing the window (the OS close button) counts as Cancel.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        device_options: list[tuple[str, str]],
+        default_label: str,
+        on_submit: Callable[[str, str, str], None],
+        on_cancel: Callable[[], None],
+    ) -> None:
+        self._value_by_label = {label: value for value, label in device_options}
+        self._on_submit = on_submit
+        self._on_cancel = on_cancel
+
+        self.top = tk.Toplevel(parent)
+        self.top.title("Label this event")
+        self.top.transient(parent)
+        self.top.grab_set()
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        frame = ttk.Frame(self.top, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Device:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.device_var = tk.StringVar(value=default_label)
+        self.device_combo = ttk.Combobox(
+            frame,
+            textvariable=self.device_var,
+            values=[label for _value, label in device_options],
+            state="readonly",
+            width=32,
+        )
+        self.device_combo.grid(row=0, column=1, sticky=tk.EW, pady=4)
+
+        ttk.Label(frame, text="Button/action:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.button_var = tk.StringVar()
+        self.button_entry = ttk.Entry(frame, textvariable=self.button_var, width=32)
+        self.button_entry.grid(row=1, column=1, sticky=tk.EW, pady=4)
+
+        ttk.Label(frame, text="Note (optional):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.note_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.note_var, width=32).grid(
+            row=2, column=1, sticky=tk.EW, pady=4
+        )
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side=tk.LEFT, padx=(0, 6))
+        self.submit_button = ttk.Button(buttons, text="Submit", command=self._submit)
+        self.submit_button.pack(side=tk.LEFT)
+
+        self.button_entry.focus_set()
+
+    def _submit(self) -> None:
+        label = self.device_var.get()
+        device_value = self._value_by_label.get(label, label)
+        button_text = self.button_var.get()
+        note = self.note_var.get()
+        self.top.destroy()
+        self._on_submit(device_value, button_text, note)
+
+    def _cancel(self) -> None:
+        self.top.destroy()
+        self._on_cancel()
