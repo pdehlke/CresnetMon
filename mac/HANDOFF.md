@@ -1,8 +1,8 @@
 # HANDOFF — end of 2026-09-01
 
 Point-in-time record. Everything below is either evidence or explicitly labelled
-as unproven. Read "Start here" and "The one open question", then dip into the
-rest as needed.
+as unproven. Read "Start here", "What we can control today" and "The open
+question", then dip into the rest as needed.
 
 ---
 
@@ -14,65 +14,58 @@ The goal is to control this house's Crestron lighting from Home Assistant.
 the CLX modules do not act on commands that don't arrive in their slot in the
 master's poll round. Do not spend more time on it. Details under "Dead ends".
 
-**The IP path works, and is one question away from being finished.** The MC2E's
-program contains an XPanel at `Slot-05.IP-ID-03` that nothing occupies. We can
-register on it, receive a full state dump plus live per-light state including
-brightness, and the processor *accepts button presses from us and acts on them*.
+**The IP path works, and reaches exactly one room.** The MC2E's program contains
+an XPanel at `Slot-05.IP-ID-03` that nothing occupies. We can register on it,
+receive a full state dump plus live per-light state including brightness, and
+the processor accepts button presses from us and drives the dimmers in response.
+Lights were physically turned on and off this way, confirmed by the owner.
 
-**The one thing that didn't work:** the light didn't physically come on. See below.
+**But every load it can reach is in the Kitchen.** All 75 press joins were
+scanned. Joins 21-35 drive five Kitchen loads; joins 36-95 drive no dimmer at
+all. The `.dsc` describes this panel as `101-Kitchen` and that is literally what
+it is. The path is proven and it does not generalise to the rest of the house.
 
 ---
 
-## The one open question
+## What we can control today
 
-At 18:04:33 we pressed XPanel digital join 24. Three independent records agree
-on what happened next:
+Five Kitchen loads, individually and as a group, over IP, with no Cresnet
+timing and no programmer. Confirmed by pressing them and looking at the room.
 
-```
-CRX:Slot-05.IP-ID-03 : Digital Join 24 is High.        <- processor received our press
-CTX:Slot-01.ID-71    : [71][06][1D][00][00][C8][03][FF] <- processor drove the dimmer
-```
-
-and our own Cresnet tap independently caught the frame on the wire:
-
-```
-offset  9523: 71 06 1d 00 00 c8 03 ff
-offset 18087: 71 06 1d 00 00 c8 03 00   (second press, toggling back)
-```
-
-**The Living Pathway lights did not come on.** Confirmed by the owner, standing
-in the room.
-
-So the command reached the right module and the right channel, and nothing lit.
-Two differences from the keypad's own frames are the obvious leads:
-
-| | keypad press (works) | our XPanel press (no light) |
+| join | drives | effect |
 |---|---|---|
-| frame to `0x70` | `70 06 1d 00 00 00 04 c3` | **none sent** |
-| frame to `0x71` | `71 06 1d 00 00 00 03 c3` | `71 06 1d 00 00 c8 03 ff` |
-| byte 5 | `00` | `c8` |
-| level | `c3` (76%) | `ff` (full) |
+| 21 | `0x71` ch4 | on, instant |
+| 22 / 23 | `0x71` ch3 | raise / lower |
+| 25 | `0x75` ch0 | on |
+| 26 | `0x72` ch3 | on |
+| 27 / 28 / 29 | `0x72` ch2 | raise / lower / off |
+| 30 | all five | full (`FF`) |
+| 31 | all five | **off** (`00`) — the one-press room clear |
+| 32 / 33 / 34 | all five | 75% / 50% / 25% |
+| 35 | all five | toggle |
 
-Two hypotheses, neither tested:
+The five loads are Island, Range, Kitchen Pathway, Powder and Cabinet, per the
+owner. `0x71` ch3 is almost certainly Powder: it is the only channel in both the
+Kitchen group and the Great Room keypad's Living Pathway pair.
 
-1. **Living Pathway is two channels and we only drove one.** The keypad drives
-   `0x70` ch4 *and* `0x71` ch3. Our press drove only `0x71` ch3, and the capture
-   confirms zero frames were addressed to `0x70` in the whole window. If the
-   fixture is one run split across two dimmer banks, half of it alone may not be
-   visibly lit, or may not be a complete circuit.
-2. **Byte 5 is a fade parameter and `C8` (200) makes the ramp effectively
-   inert.** The keypad uses `00` there. Analog join 21 did ramp smoothly through
-   81 steps to 65535 over about two seconds, so the *program* believes it
-   completed, but that is the program's model, not the lamp.
+Joins 36-95 drive nothing. Many of them flip feedback pairs exactly 31 apart
+(`d53`/`d84`, `d54`/`d85`, ...), which looks like page selection on a panel
+whose lighting controls only ever addressed one room.
 
-Digital join 35 also went high alongside 24 and nothing was sent to `0x70`, which
-is itself worth explaining.
+## The open question
 
-**Next action:** press join 35 alone and see whether it drives `0x70` ch4. If it
-does, joins 24 and 35 are the two halves of Living Pathway and hypothesis 1 is
-confirmed. That is a five-minute test with `poc_joinpress.py --join 35`.
+**How to reach the other thirteen rooms.** Their loads are wired to keypads and
+touch panels, not to this XPanel slot. Two candidate routes, neither explored:
 
----
+1. Another free IP-ID with a wider join map. The `.dsc` shows only `IP-ID-03`
+   and `IP-ID-05` on the MC2E, so this may require a slot that does not exist.
+2. The EISC at `Slot-05.IP-ID-05`, which carries whole-house joins (`d58` Entry
+   Center, `d99` Sink Area, `d103` Pool Bath were confirmed on 2026-08-31). It
+   is occupied by the AADS, and displacing it breaks audio and the ST-IO. That
+   is the known blocker and it has not moved.
+
+Note that the second route is the one with the whole-house join map already
+partly built. It is worth understanding exactly what breaks before dismissing it.
 
 ## What is proven
 
@@ -181,9 +174,20 @@ makes an excellent liveness gate and corruption detector.
 **Cresnet opcodes:** `03` update request / all clear, `14` analog joins, `1C`
 re-initialisation carrying a channel map, `1D` set channel level.
 
-**`1D` frame:** `<dest> 06 1D 00 00 <fade?> <channel> <level>`. Byte 5 is `00` in
-keypad-originated frames and `C8` in XPanel-originated ones. Unconfirmed, but it
-sits exactly where a fade rate would.
+**`1D` frame:** `<dest> <size> 1D 00 <fade hi> <fade lo> <channel> <level>`, with
+the channel/level pair repeating for multi-channel loads (`size` 0x06 for one
+channel, 0x08 for two). The fade field is 16 bits and varies with the button:
+
+| button | fade field | meaning |
+|---|---|---|
+| keypad, and XPanel "on" | `00 00` | instant |
+| XPanel preset | `00 C8` | 200, about two seconds |
+| XPanel raise | `01 F4` | 500, slow ramp |
+| XPanel lower | `00 18` | 24, fast fade |
+
+This was got wrong three times in one day: first read as a single byte, then
+hard-coded to `00` in a frame matcher, then hard-coded to size `0x06`. Each
+error silently hid real frames from the bus analysis.
 
 **`1C` channel map** gives per-module channel configuration. The flag reads as
 *this channel dims* rather than switches, and holds for every channel with
@@ -213,6 +217,7 @@ graduates from proof-of-concept.
 | `cip_xpanel.py` | CIP client, registers on any host/IP-ID, listen-only |
 | `poc_joinwatch.py` | three passive streams while someone presses a keypad |
 | `poc_joinpress.py` | **presses an XPanel join** — the only tool that writes over IP |
+| `poc_joinscan.py` | scans a join range, recording what each one drives |
 | `poc_witness.py` | asks the processor whether it hears our Cresnet writes |
 | `poc_override.py` | tests whether the processor undoes our Cresnet writes |
 | `poc_inject.py`, `living_pathway.py` | Cresnet injection, superseded, kept as record |
@@ -270,11 +275,18 @@ It is deliberately **not committed** — see the note at the bottom of this file
 
 ## Known defects in our own tools
 
-- `poc_joinpress.py` and `poc_joinwatch.py` search for `1D` frames with the
-  keypad's `1d 00 00 00` form hard-coded, so they miss the XPanel's
-  `1d 00 00 c8` form and report "0 level commands" when frames are present.
-  This caused a wrong conclusion once today. Fix before trusting their bus
-  summaries; the saved JSON evidence is complete either way.
+- **`poc_joinscan.py` does not restore non-toggle buttons.** It presses each
+  join twice on the assumption everything toggles. That holds for join 35 but
+  not for the level presets (30-34), where a second press simply re-applies the
+  preset. A scan therefore leaves each room lit at whatever the last preset it
+  hit commands. After the 21-40 scan the Kitchen sat at 25% until cleared by
+  hand. Fix by pressing the room's off-preset after each group button, or by
+  recording state and restoring explicitly.
+- `poc_joinwatch.py` still searches for `1D` frames with the keypad's
+  `1d 00 00 00` form hard-coded, so it misses the XPanel's `1d 00 00 c8` form
+  and reports "0 level commands" when frames are present. `poc_joinpress.py`
+  had the same bug plus a hard-coded size; both are fixed there and the fix
+  should be lifted into a shared helper.
 - `cip_xpanel.py` has no tests despite having had three decoding bugs that
   produced a day-long false negative.
 

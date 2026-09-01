@@ -111,7 +111,7 @@ def pump(sock: socket.socket, listener: Listener, seconds: float) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Press an XPanel join and watch the house.")
-    ap.add_argument("--join", type=int, default=24)
+    ap.add_argument("--join", default="24", help="digital join(s), comma-separated")
     ap.add_argument("--presses", type=int, default=2, help="toggle back by pressing again")
     ap.add_argument("--watch", type=float, default=15.0, help="seconds to watch after each press")
     ap.add_argument("--port", help="serial device (default: autodetect)")
@@ -119,8 +119,11 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    down, up = digital(args.join, True), digital(args.join, False)
-    print(f"digital join {args.join}: press {down.hex(' ')}   release {up.hex(' ')}")
+    joins = [int(j) for j in args.join.split(",")]
+    downs = [digital(j, True) for j in joins]
+    ups = [digital(j, False) for j in joins]
+    for j, d, u in zip(joins, downs, ups, strict=True):
+        print(f"digital join {j}: press {d.hex(' ')}   release {u.hex(' ')}")
     print(f"{args.presses} press(es), {args.watch:.0f}s watch each, SDEBUG on "
           f"{XPANEL_SLOT} and {len(MODULES)} CLX modules")
     if args.dry_run:
@@ -158,10 +161,14 @@ def main() -> int:
 
         for i in range(1, args.presses + 1):
             marks.append((f"press{i}", time.time()))
-            print(f"\n=== PRESS {i}/{args.presses}: join {args.join} ===", flush=True)
-            cip.sendall(down)
+            print(f"\n=== PRESS {i}/{args.presses}: join(s) {args.join} ===", flush=True)
+            # Both halves of a two-channel load must go down together, or the
+            # program sees two unrelated single-load presses.
+            for d in downs:
+                cip.sendall(d)
             time.sleep(HOLD_SECONDS)
-            cip.sendall(up)
+            for u in ups:
+                cip.sendall(u)
             pump(cip, listener, args.watch)
 
         t_end = time.time()
@@ -180,8 +187,14 @@ def main() -> int:
         buf = tap.between(marks[1][1] - 1, t_end)
         found = 0
         for i in range(len(buf) - 7):
-            if buf[i + 1] == 0x06 and buf[i + 2] == 0x1D and buf[i + 3 : i + 6] == b"\x00\x00\x00":
-                print(f"  * {buf[i : i + 8].hex(' ')}")
+            # Take the size byte from the frame rather than assuming it. Two
+            # earlier versions of this check were wrong in turn: one required
+            # bytes 3-5 to be 00 00 00 (the keypad's form, missing the C8 the
+            # XPanel path uses), and one hard-coded size 0x06, missing every
+            # multi-channel frame, which is exactly what a grouped load sends.
+            size = buf[i + 1]
+            if buf[i + 2] == 0x1D and 6 <= size <= 32 and i + 2 + size <= len(buf):
+                print(f"  * {buf[i : i + 2 + size].hex(' ')}")
                 found += 1
         print(f"  {found} level command(s)")
 
@@ -190,7 +203,7 @@ def main() -> int:
         out.write_text(
             json.dumps(
                 {
-                    "join": args.join,
+                    "joins": joins,
                     "marks": marks,
                     "changes": listener.changes,
                     "console": [[ts, ln] for ts, ln in console.lines],
