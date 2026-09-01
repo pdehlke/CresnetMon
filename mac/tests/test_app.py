@@ -18,6 +18,7 @@ from cresnetmon import config as config_module
 from cresnetmon.app import APP_TITLE, CresnetMonApp, DeviceIdError, parse_device_id
 from cresnetmon.capture import CaptureWriter
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick
+from cresnetmon.rawlog import RawLogWriter
 from cresnetmon.serial_io import SerialReader
 
 
@@ -121,6 +122,54 @@ def test_start_success_toggles_running_and_drains_events_into_rows(
     app.window.start_button.invoke()  # stop
     assert app.window.start_button["text"] == "Start"
     assert fake_port.is_open is False
+
+
+def test_start_without_raw_log_toggle_creates_no_raw_writer(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    fake_port = _FakePort()
+    monkeypatch.setattr("cresnetmon.app.open_port", lambda device: fake_port)
+    app = CresnetMonApp(root)
+
+    app.window.start_button.invoke()
+
+    assert app._raw_queue is None
+    assert app._raw_writer is None
+    assert app._reader is not None
+    assert app._reader._raw_queue is None  # SerialReader got the default
+
+    app.window.start_button.invoke()  # stop
+
+
+def test_start_with_raw_log_toggle_creates_writer_and_wires_reader(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """STRATEGY.md task 14: checking Raw log before Start creates a fresh
+    RawLogWriter and hands SerialReader the queue that feeds it; Stop
+    clears both, matching "starts and stops with monitoring"."""
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    monkeypatch.setattr("cresnetmon.app.RawLogWriter", lambda: RawLogWriter(tmp_path))
+    fake_port = _FakePort()
+    monkeypatch.setattr("cresnetmon.app.open_port", lambda device: fake_port)
+    app = CresnetMonApp(root)
+    app.window.raw_log_var.set(True)
+
+    app.window.start_button.invoke()
+
+    assert app._raw_queue is not None
+    assert isinstance(app._raw_writer, RawLogWriter)
+    assert app._reader is not None
+    assert app._reader._raw_queue is app._raw_queue
+    # Not yet written (no bytes drained yet), but pointed at the redirected
+    # directory with the expected naming convention.
+    assert app._raw_writer.path.parent == tmp_path
+    assert app._raw_writer.path.name.endswith("-raw.jsonl")
+
+    app.window.start_button.invoke()  # stop
+
+    assert app._raw_queue is None
+    assert app._raw_writer is None
 
 
 def test_message_event_filtered_by_device_id(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,7 +474,18 @@ def test_full_arm_to_submit_flow_writes_a_real_capture_file(
     assert record["button"] == "dim up"
     assert record["note"] == "Foyer cans to 100%"
     assert record["frames"] == [
-        {"dev_id": "0x67", "cycle": 0, "text": "11 22 33", "to_master": False}
+        {
+            "dev_id": "0x67",
+            "cycle": 0,
+            "text": "11 22 33",
+            "to_master": False,
+            # read_at is None here: this test drives CresnetProtocol
+            # directly (see the feed() loop above), bypassing
+            # SerialReader._run() - the only place read_at gets attached.
+            "t": None,
+            "dest_id": "0x67",
+            "raw": "67 03 11 22 33",
+        }
     ]
     assert app._armed is True  # auto-rearmed after a real submit
     assert app.window.arm_button["text"] == "Disarm"

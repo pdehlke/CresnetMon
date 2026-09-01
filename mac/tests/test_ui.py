@@ -75,6 +75,35 @@ def test_arm_button_starts_disabled_and_follows_running_state(
     assert str(window.arm_button["state"]) == "disabled"
 
 
+def test_raw_log_defaults_off_and_disables_while_running(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """STRATEGY.md task 14: off by default, and - like port/device-id, not
+    like Arm - only settable before Start since app.py reads it once."""
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    window = CresnetMonWindow(root)
+
+    assert window.raw_log_var.get() is False
+    assert str(window.raw_log_check["state"]) == "normal"
+
+    window.set_running(running=True)
+    assert str(window.raw_log_check["state"]) == "disabled"
+
+    window.set_running(running=False)
+    assert str(window.raw_log_check["state"]) == "normal"
+
+
+def test_raw_log_checkbox_toggles_the_var(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    window = CresnetMonWindow(root)
+
+    window.raw_log_check.invoke()
+    assert window.raw_log_var.get() is True
+
+    window.raw_log_check.invoke()
+    assert window.raw_log_var.get() is False
+
+
 def test_set_armed_toggles_arm_button_text(root: tk.Tk, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
     window = CresnetMonWindow(root)

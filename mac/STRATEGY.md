@@ -128,8 +128,10 @@ so a bad session doesn't corrupt earlier reps. Record shape:
   "burst_started": "2026-08-05T15:41:12.114-05:00",
   "burst_closed": "2026-08-05T15:41:12.640-05:00",
   "frames": [
-    {"dev_id": "0x67", "cycle": 118, "text": "11 22 33", "to_master": true},
-    {"dev_id": "0x70", "cycle": 118, "text": "AA 01 64", "to_master": false}
+    {"dev_id": "0x67", "cycle": 118, "text": "11 22 33", "to_master": true,
+     "t": 1756642872.114, "dest_id": "0x02", "raw": "02 03 11 22 33"},
+    {"dev_id": "0x70", "cycle": 118, "text": "AA 01 64", "to_master": false,
+     "t": 1756642872.201, "dest_id": "0x70", "raw": "70 03 AA 01 64"}
   ],
   "device": {"id": "0x67", "model": "CNX-B8", "room": "103 - Foyer"},
   "button": "button 3 (dim up)",
@@ -138,7 +140,9 @@ so a bad session doesn't corrupt earlier reps. Record shape:
 ```
 
 `frames` is the raw `Message` events from `protocol.py`, unmodified — no new
-parsing logic, just grouping by burst.
+parsing logic, just grouping by burst. `t`/`dest_id`/`raw` were added in
+task 13; see that task for what they're for and why `dev_id` alone wasn't
+enough.
 
 No cross-repo path is hardcoded. When a session is ready to feed the HA
 automation constructor, the `.jsonl` file is copied into the `homeassistant`
@@ -264,6 +268,126 @@ Real end-to-end verified outside the test suite too: a real `CresnetMonApp`
 armed, a real `LabelDialog`'s real Submit button clicked, a real file
 landed in `mac/captures/` with the expected content.
 
+13. ✅ **Enrich labeled JSONL frames** — the first live capture
+    (`mac/captures/20260831T075334.jsonl`) analyzed fine at the frame
+    level, but two gaps blocked further reverse-engineering and can't be
+    recovered from already-written files: no per-frame timestamp (so
+    inter-frame gaps, and solicited-vs-unsolicited bus writes, are
+    unmeasurable), and no raw frame bytes (`_finish_message` kept only the
+    payload, discarding the destination and size bytes `protocol.py`
+    already has in state). `protocol.Message` gains three fields -
+    `dest_id` (the destination byte actually read for this frame),
+    `raw` (dest + size + payload, exactly as it crossed the bus), and
+    `read_at` (wall-clock `time.time()`, defaulting to `None`) - added,
+    not renamed, so already-captured files' existing fields
+    (`dev_id`/`cycle`/`text`/`to_master`) keep their original meaning.
+    `capture.py` serializes them as `t`/`dest_id`/`raw` alongside the
+    existing frame fields.
+
+    `raw`/`dest_id` are built in `_finish_message()` itself - it already
+    tracks `_dest_id`, and gained a `_frame_size_byte` scratch field
+    (`_msg_size` counts down during Payload and reads 0 at finish, so the
+    original size byte needed its own copy). This also finally answers,
+    in the data itself rather than just in a docstring, the "inferred vs
+    read" question `_send_id` raised: when `to_master`, `dest_id ==
+    MASTER_ADDR` and `dev_id` is send_id, an inference; otherwise
+    `dest_id == dev_id`, read directly off the wire.
+
+    `read_at` could not be set in `protocol.py` without breaking its
+    no-clock-reads purity rule, so `Message` carries the field but always
+    hands it back `None`; `serial_io.py`'s `SerialReader._run()` -
+    already the exact point where a byte comes off the wire - attaches
+    the real timestamp via `dataclasses.replace()` right after
+    `protocol.feed()` returns a `Message`. Attaching it in `app.py`
+    instead (also allowed per the task) was rejected: `app.py` only sees
+    events after they cross a queue drained on a 50ms `tk.after()` timer,
+    which would quantize every timestamp to that cadence and defeat the
+    point of measuring inter-frame gaps precisely.
+
+    Existing fixtures across `tests/test_burst.py`/`tests/test_capture.py`
+    that construct bare `Message(...)` literals for grouping/serialization
+    tests unrelated to `protocol.py`'s own byte-level correctness needed
+    no changes, since the three new fields default; `tests/test_protocol.py`
+    and `tests/test_capture.py`'s expected-JSON assertions were updated to
+    verify the real computed values. New tests in `tests/test_serial_io.py`
+    cover `read_at` attachment with a monkeypatched clock.
+
+14. ✅ **Raw byte-stream log** — the more important gap: `burst.py` drops
+    `PollTick` by design (task 9) and `protocol.py` only counts a polling
+    cycle for one reference device (STRATEGY.md's protocol notes above),
+    so the master's actual polling behavior - the top risk for an eventual
+    bridge to replicate correctly - is completely invisible in every
+    existing output format, and unrecoverable from already-written
+    capture files. New `rawlog.py`/`RawLogWriter` writes every raw byte,
+    decoded or not, to `mac/captures/<session-start>-raw.jsonl`: one JSON
+    object per line, `{"t": <float epoch seconds>, "hex": "00 62 03 ..."}`,
+    same open/append/close-per-write durability posture as
+    `capture.CaptureWriter`. Concatenating every record's `hex` field, in
+    file order, reproduces the exact byte stream - verified for real (see
+    below), not just asserted.
+
+    Gated behind a new "Raw log" `ttk.Checkbutton` in `ui.py`
+    (`raw_log_var`, off by default), read once in `app.py`'s `_start()`
+    like the port/device-id fields - not a live toggle, and not tied to
+    Arm/Disarm. Deliberately starts and stops with monitoring rather than
+    persisting across a launch's multiple Start/Stop cycles like
+    `CaptureWriter` does: a fresh `RawLogWriter` (fresh file) is created
+    on every Start, because poll traffic - this log's whole reason to
+    exist - is exactly what's on the bus while nothing is armed, which has
+    nothing to do with how many times the app itself has been restarted.
+
+    **Chunking granularity - the actual design question here.** The task
+    brief's suggested shape is "one JSON object per serial read chunk."
+    `SerialReader._run()` reads one byte per OS `read()` call today, so
+    the most literal reading would log one JSON object per byte. Rejected:
+    each record's JSON syntax (`{"t": ..., "hex": ...}\n`) runs about 35
+    bytes of overhead around 1-3 hex-text bytes of actual payload - roughly
+    an order of magnitude past the "tens of MB of hex text" size estimate
+    already written into this doc's "Labeling / capture mode" section
+    above, which only pencils out if the overhead stays close to plain
+    concatenated hex text. Also considered: change `SerialReader` to read
+    larger OS-level chunks (e.g. sized by `in_waiting`) so a "chunk" means
+    something bigger than one byte at the I/O layer itself. Rejected too -
+    `open_port()` opens the port with no read timeout, so `read()` blocks
+    until it has as many bytes as requested; forcing a bigger read size
+    risks stalling event delivery to the *live, non-raw-log* view during
+    quiet stretches on the bus, a behavior change to the primary
+    monitoring path that's out of scope for a recording-fidelity task and
+    unverifiable without live hardware regardless.
+
+    What shipped instead: the OS-level read stays byte-at-a-time,
+    unchanged. When raw logging is on, `SerialReader` also pushes each
+    raw byte (bare `int`, no per-byte clock read - cheap) onto a second
+    queue; `app.py`'s existing `_poll_events()` 50ms `tk.after()` tick -
+    already draining the protocol-events queue every cycle - now also
+    drains the raw queue each tick, concatenates whatever's there into one
+    chunk, and writes it as a single record stamped with the drain-time
+    wall clock. This reuses the queue-plus-`tk.after()`-poll pattern
+    already established for protocol events instead of inventing new
+    buffering/threshold logic, and keeps output size close to the
+    plain-hex-text estimate (roughly 4% JSON overhead at Cresnet's
+    38400-baud throughput and a 50ms drain cadence, by rough calculation -
+    a chunk holds on the order of 190 bytes under continuous traffic,
+    against ~25 bytes of fixed JSON overhead per record). Per the task
+    brief, only the chunk gets a timestamp - never individual bytes within
+    it - so the reader thread's per-byte hot path does no clock work at
+    all when raw logging is off, and only a queue-put when it's on.
+
+    **Verified for real**, not just asserted: a new end-to-end test in
+    `tests/test_end_to_end.py` runs the full `CresnetMonApp` stack against
+    a fake serial port with raw logging enabled, waits for the fake port's
+    buffer to fully drain, stops, then reads the resulting `-raw.jsonl`
+    back and asserts the concatenated `hex` fields equal the exact input
+    byte sequence. `mac/.gitignore`'s existing `captures/` rule already
+    covers the new `-raw.jsonl` suffix - no gitignore change needed
+    (checked, not assumed).
+
+**Status.** All 14 tasks done, including the two above. Working tree is
+uncommitted at time of writing - the repo owner reviews before committing,
+per this project's standing rule. Test count and ruff status: see the
+handoff/session notes for the run that did this work rather than this
+paragraph, which won't be kept in sync with every future test added.
+
 Next, if picked back up: nothing is required for the tool to be usable as
 built. Possible follow-ups noted along the way and not yet done: a custom
 `.app` icon (task 7), bundling the seed JSON as PyInstaller data so
@@ -275,4 +399,8 @@ Tasks are sequential (2 depends on 1; 3-6 depend on 2; 7-8 depend on the
 rest) but 2 is independently testable/valuable without hardware or a GUI —
 started first after scaffolding. 9 depends only on 2 (pure logic, buildable
 independently of the UI); 10-12 depend on 5 (need a working live UI to hang
-Arm/labeling off of) and on 9.
+Arm/labeling off of) and on 9. 13 depends on 2 and 3 (needs `protocol.py`'s
+state and `serial_io.py`'s read loop); 14 depends on 3 and 5 (needs the
+reader's read loop and the running app's polling loop) but not on 13 - the
+two are independent fixes to different gaps in the same first-capture
+review.

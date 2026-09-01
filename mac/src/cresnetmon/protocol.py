@@ -2,7 +2,11 @@
 
 Pure translation of the byte-level parser in the original Windows app —
 `CresNetProcessByte`/`ShowMessage` in `CresnetMon/MainForm.cs:141-223`. No
-serial I/O, no UI: feed it bytes one at a time, get back events.
+serial I/O, no UI, no clock reads: feed it bytes one at a time, get back
+events. `Message.read_at` exists as a field but is always `None` coming out
+of here - wall-clock timestamps are the caller's job (see `Message`'s
+docstring and STRATEGY.md task 13), same as `burst.py` taking
+caller-supplied timestamps instead of reading its own clock.
 
 Device-ID filtering (0 = all, else match a specific device) is *not* done
 here, unlike the original where `ShowMessage` filtered before displaying.
@@ -43,12 +47,33 @@ class Message:
     `cycle` is the polling-cycle count *at the time of* the message (not
     incremented by the message itself — only `PollTick` advances it),
     matching the "ID" column in the original UI.
+
+    `dev_id` is `send_id` when `to_master` is true — an *inference* from
+    the last non-master address seen in READY state, not a byte this frame
+    itself carried. `dest_id` is the byte actually read as this frame's
+    destination, so a later reader can always tell inferred source from
+    read destination: when `to_master`, `dest_id == MASTER_ADDR` and
+    `dev_id` is the inference; otherwise `dest_id == dev_id`, read directly.
+
+    `raw` is the frame exactly as it crossed the bus - destination byte,
+    size byte, then payload - not just the payload `text` already encodes.
+    Added in STRATEGY.md task 13 to close a gap the first live capture
+    exposed: `text` alone can't be re-decoded from scratch since it drops
+    the address/size framing around the payload.
+
+    `read_at` is a wall-clock (`time.time()`) timestamp. This module never
+    sets it - see the module docstring's purity note - so it defaults to
+    `None` here; the caller (serial_io.py's `SerialReader`) attaches the
+    real value via `dataclasses.replace()` once a `Message` is produced.
     """
 
     cycle: int
     text: str
     dev_id: int
     to_master: bool
+    dest_id: int = 0
+    raw: bytes = b""
+    read_at: float | None = None
 
 
 type ProtocolEvent = PollTick | Message
@@ -69,6 +94,7 @@ class CresnetProtocol:
         self._send_id = 0
         self._poll_id = 0
         self._msg_size = 0
+        self._frame_size_byte = 0
         self._message: list[int] = []
         self.msg_count = 0
 
@@ -97,6 +123,9 @@ class CresnetProtocol:
                     return None
                 if byte != 0:
                     self._msg_size = byte
+                    # _msg_size counts down as payload bytes arrive; this
+                    # copy survives to _finish_message() for `raw`.
+                    self._frame_size_byte = byte
                     self._state = _State.PAYLOAD
                     return None
                 return self._end_addressed_frame()
@@ -120,6 +149,7 @@ class CresnetProtocol:
         self._state = _State.SEARCHING
         self._message = []
         self._msg_size = 0
+        self._frame_size_byte = 0
 
     def clear_counts(self, *, keep_poll_reference: bool) -> None:
         """Reset the display counter, mirroring `btnClear_Click` (MainForm.cs:292-298).
@@ -147,11 +177,14 @@ class CresnetProtocol:
     def _finish_message(self) -> Message:
         dest = self._send_id if self._dest_id == MASTER_ADDR else self._dest_id
         text = " ".join(f"{b:02X}" for b in self._message)
+        raw = bytes([self._dest_id, self._frame_size_byte, *self._message])
         event = Message(
             cycle=self.msg_count,
             text=text,
             dev_id=dest,
             to_master=self._dest_id == MASTER_ADDR,
+            dest_id=self._dest_id,
+            raw=raw,
         )
         self._message = []
         self._state = _State.READY

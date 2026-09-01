@@ -5,9 +5,16 @@ earlier reps. Input for the not-yet-built Home Assistant automation
 constructor in the homeassistant repo - see STRATEGY.md's "Labeling /
 capture mode" section for the record shape and why.
 
-Decoupled from devices.py/protocol.py beyond the Burst type itself: the
-caller (app.py) assembles the `device` dict and the wall-clock bounds;
-this module only serializes what it's given.
+Decoupled from devices.py/protocol.py beyond the Burst/Message types
+themselves: the caller (app.py) assembles the `device` dict and the
+wall-clock bounds; this module only serializes what it's given.
+
+Per-frame fields `t`, `dest_id`, and `raw` were added in STRATEGY.md task
+13, closing gaps the first live capture exposed: `cycle` alone can't show
+inter-frame timing, and `dev_id` alone can't show whether it was read
+directly off the wire or inferred (see protocol.Message's docstring).
+Existing field names (`dev_id`, `cycle`, `text`, `to_master`) keep their
+original meaning unchanged so already-captured files stay readable.
 """
 
 import json
@@ -48,6 +55,9 @@ class CaptureWriter:
                     "cycle": message.cycle,
                     "text": message.text,
                     "to_master": message.to_master,
+                    "t": message.read_at,
+                    "dest_id": f"0x{message.dest_id:02X}",
+                    "raw": " ".join(f"{b:02X}" for b in message.raw),
                 }
                 for message in burst.messages
             ],

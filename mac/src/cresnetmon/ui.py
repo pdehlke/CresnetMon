@@ -9,8 +9,8 @@ code.
 
 Mirrors the widget set in MainForm.Designer.cs: selComPort, txtDeviceId,
 btnStart, btnClear, viewResults (ListView -> ttk.Treeview), statusText. The
-Arm button and LabelDialog have no original-app equivalent - new for the
-labeling/capture mode (STRATEGY.md).
+Arm button, Raw log checkbox, and LabelDialog have no original-app
+equivalent - new for the labeling/capture mode (STRATEGY.md).
 """
 
 import tkinter as tk
@@ -61,6 +61,10 @@ class CresnetMonWindow:
         self.port_var = tk.StringVar(value=initial_port)
         self.device_id_var = tk.StringVar(value=initial_device_id)
         self.status_var = tk.StringVar(value="Polling count: 0")
+        # Off by default (STRATEGY.md task 14) - not persisted like
+        # port/device-id, since it's a deliberate one-session choice, not
+        # a standing preference.
+        self.raw_log_var = tk.BooleanVar(value=False)
 
         self._build_widgets()
         self._on_refresh_ports()
@@ -88,6 +92,13 @@ class CresnetMonWindow:
         self.arm_button = ttk.Button(top, text="Arm", command=self._on_arm_disarm)
         self.arm_button.configure(state=tk.DISABLED)
         self.arm_button.pack(side=tk.LEFT, padx=(12, 0))
+
+        # Set before Start, like the port/device-id fields above - not a
+        # live toggle. app.py reads it once, in _start(). Raw logging is
+        # meant to start and stop with monitoring, not with Arm/Disarm
+        # (STRATEGY.md task 14), so it lives here rather than next to Arm.
+        self.raw_log_check = ttk.Checkbutton(top, text="Raw log", variable=self.raw_log_var)
+        self.raw_log_check.pack(side=tk.LEFT, padx=(12, 0))
 
         self.results = ttk.Treeview(self.root, columns=COLUMNS, show="headings")
         for col in COLUMNS:
@@ -117,11 +128,15 @@ class CresnetMonWindow:
     def set_running(self, *, running: bool) -> None:
         """Toggle widget state/labels for start/stop, mirroring
         btnStart_Click's UI updates (MainForm.cs:263-290). Arm is only
-        ever clickable while running - labeling needs a live bus."""
+        ever clickable while running - labeling needs a live bus. Raw log
+        is disabled while running for the opposite reason: it's read once
+        at Start, like port/device-id, so changing it mid-run wouldn't do
+        anything."""
         self.start_button.configure(text="Stop" if running else "Start")
         self.port_combo.configure(state=tk.DISABLED if running else "readonly")
         self.device_id_entry.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.arm_button.configure(state=tk.NORMAL if running else tk.DISABLED)
+        self.raw_log_check.configure(state=tk.DISABLED if running else tk.NORMAL)
 
     def set_armed(self, *, armed: bool) -> None:
         """Toggle the Arm/Disarm label. Separate from set_running() since

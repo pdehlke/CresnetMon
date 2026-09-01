@@ -6,17 +6,25 @@ No UI code here; see ui.py (tasks 4-5) for how events get displayed. Mirrors
 the read loop in MainForm.cs:141-208 (CresNetProcessByte) and the port-open
 logic in MainForm.cs:86-99 (OpenPort), split out as pure I/O plumbing around
 the already-ported protocol.CresnetProtocol.
+
+This is also where the two wall-clock reads protocol.py deliberately can't
+do live: attaching `Message.read_at` and (optionally) mirroring every raw
+byte onto `raw_queue` for the raw byte-stream log (STRATEGY.md task 14).
+Both happen right here, at the moment a byte is actually read off the wire,
+rather than later at queue-drain time in app.py - that avoids smearing
+timestamps to app.py's 50ms polling cadence.
 """
 
 import queue
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import serial
 from serial.tools import list_ports as _list_ports
 
-from cresnetmon.protocol import CresnetProtocol, ProtocolEvent
+from cresnetmon.protocol import CresnetProtocol, Message, ProtocolEvent
 
 BAUD_RATE = 38400  # matches MainForm.cs:90; Cresnet's fixed bus speed
 
@@ -78,12 +86,27 @@ class SerialReader:
     start/clear semantics (CresnetProtocol.start()/clear_counts()) stay the
     caller's responsibility - mirrors MainForm's button handlers owning
     those calls around the read loop rather than the loop owning them.
+
+    `raw_queue`, if given, receives every raw byte read (as an int 0-255),
+    independent of whatever protocol.py does with it - including bytes that
+    are part of routine polling, which protocol.py mostly discards. This is
+    the raw byte-stream log's tap point (STRATEGY.md task 14); app.py owns
+    deciding whether to pass one in (the raw-log toggle) and draining it.
+    `None` (the default) costs nothing extra per byte beyond the `is None`
+    check - existing callers that don't pass it are unaffected.
     """
 
-    def __init__(self, port: SerialPort, protocol: CresnetProtocol) -> None:
+    def __init__(
+        self,
+        port: SerialPort,
+        protocol: CresnetProtocol,
+        *,
+        raw_queue: queue.Queue[int] | None = None,
+    ) -> None:
         self._port = port
         self._protocol = protocol
         self._events: queue.Queue[ProtocolEvent] = queue.Queue()
+        self._raw_queue = raw_queue
         self._thread: threading.Thread | None = None
 
     @property
@@ -114,6 +137,11 @@ class SerialReader:
                 return
             if not data:
                 continue
-            event = self._protocol.feed(data[0])
+            byte = data[0]
+            if self._raw_queue is not None:
+                self._raw_queue.put(byte)
+            event = self._protocol.feed(byte)
             if event is not None:
+                if isinstance(event, Message):
+                    event = replace(event, read_at=time.time())
                 self._events.put(event)

@@ -1,15 +1,17 @@
 """Wires the UI shell to the serial/protocol/config/burst/capture layers.
 
 The only module that knows about ui.py, serial_io.py, protocol.py,
-config.py, devices.py, burst.py, and capture.py together: start/stop
-handling, device-id filter parsing, error dialogs, draining the
+config.py, devices.py, burst.py, capture.py, and rawlog.py together:
+start/stop handling, device-id filter parsing, error dialogs, draining the
 SerialReader's event queue into Treeview rows via tk.after() polling
 (tkinter isn't thread-safe; the reader thread only ever touches the
 queue), restoring/persisting window geometry plus last-used port/
-device-id across launches, and the labeling/capture mode's arm/burst/
-dialog/write flow (STRATEGY.md's "Labeling / capture mode" section).
+device-id across launches, the labeling/capture mode's arm/burst/dialog/
+write flow, and the raw byte-stream log's own queue/write flow
+(STRATEGY.md's "Labeling / capture mode" section and task 14).
 """
 
+import queue
 import time
 import tkinter as tk
 from dataclasses import replace
@@ -21,6 +23,7 @@ from cresnetmon.burst import Burst, BurstGrouper
 from cresnetmon.capture import CaptureWriter
 from cresnetmon.devices import format_device_label, load_seed
 from cresnetmon.protocol import CresnetProtocol, Message, PollTick, ProtocolEvent
+from cresnetmon.rawlog import RawLogWriter
 from cresnetmon.serial_io import PortOpenError, SerialReader, open_port
 from cresnetmon.ui import CresnetMonWindow, LabelDialog
 
@@ -62,6 +65,8 @@ class CresnetMonApp:
         self._armed = False
         self._burst_started_wall: datetime | None = None
         self._capture_writer: CaptureWriter | None = None
+        self._raw_queue: queue.Queue[int] | None = None
+        self._raw_writer: RawLogWriter | None = None
 
         self.window = CresnetMonWindow(
             root,
@@ -102,7 +107,13 @@ class CresnetMonApp:
         """Mirrors btnStart_Click's start branch (MainForm.cs:273-289):
         validate the device-id filter, open the port, reset parse state,
         launch the reader. Unlike the original, a failed port open shows an
-        error dialog instead of failing silently (STRATEGY.md task 5)."""
+        error dialog instead of failing silently (STRATEGY.md task 5).
+
+        The raw log toggle is read here, once, like the port/device-id
+        fields - raw logging starts and stops with monitoring, not with
+        Arm/Disarm (STRATEGY.md task 14), and a fresh RawLogWriter (fresh
+        file) is created per Start rather than reused across a launch's
+        Start/Stop cycles."""
         try:
             self._device_filter = parse_device_id(self.window.device_id_var.get())
         except DeviceIdError as exc:
@@ -116,7 +127,13 @@ class CresnetMonApp:
             return
 
         self._protocol.start()
-        self._reader = SerialReader(port, self._protocol)
+        if self.window.raw_log_var.get():
+            self._raw_queue = queue.Queue()
+            self._raw_writer = RawLogWriter()
+        else:
+            self._raw_queue = None
+            self._raw_writer = None
+        self._reader = SerialReader(port, self._protocol, raw_queue=self._raw_queue)
         self._reader.start()
         self._running = True
         self.window.set_running(running=True)
@@ -128,6 +145,7 @@ class CresnetMonApp:
         progress is discarded rather than left to time out later."""
         if self._reader is not None:
             self._drain_events(self._reader)  # pick up any last events
+            self._drain_raw_events()  # flush any trailing raw bytes
             self._reader.stop()
             self._reader = None
         self._running = False
@@ -135,6 +153,8 @@ class CresnetMonApp:
         self._armed = False
         self._burst.reset()
         self.window.set_armed(armed=False)
+        self._raw_queue = None
+        self._raw_writer = None
 
     def _on_clear(self) -> None:
         """Mirrors btnClear_Click (MainForm.cs:292-298): counter always
@@ -146,6 +166,7 @@ class CresnetMonApp:
     def _poll_events(self) -> None:
         if self._reader is not None:
             self._drain_events(self._reader)
+            self._drain_raw_events()
         if self._armed:
             self._check_burst()
         if self._running:
@@ -154,6 +175,21 @@ class CresnetMonApp:
     def _drain_events(self, reader: SerialReader) -> None:
         while not reader.events.empty():
             self._handle_event(reader.events.get_nowait())
+
+    def _drain_raw_events(self) -> None:
+        """Batch every byte currently queued on the raw-log queue into one
+        chunk and write it as a single record, timestamped now. Batching at
+        this polling cadence (rather than one record per byte) keeps the
+        raw log's size proportional to what's actually on the wire -
+        STRATEGY.md task 14 has the sizing math this relies on. No-op if
+        raw logging wasn't enabled for this run (STRATEGY.md task 14)."""
+        if self._raw_queue is None or self._raw_writer is None:
+            return
+        chunk = bytearray()
+        while not self._raw_queue.empty():
+            chunk.append(self._raw_queue.get_nowait())
+        if chunk:
+            self._raw_writer.write(bytes(chunk), t=time.time())
 
     def _handle_event(self, event: ProtocolEvent) -> None:
         if self._armed:

@@ -10,16 +10,19 @@ recording" available without real hardware.
 Requires a real display; skips itself if Tk can't initialize.
 """
 
+import json
 import re
 import time
 import tkinter as tk
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from cresnetmon.app import CresnetMonApp
 from cresnetmon.config import Settings
 from cresnetmon.protocol import MASTER_ADDR
+from cresnetmon.rawlog import RawLogWriter
 
 DEVICE_A = 0x05
 DEVICE_B = 0x07
@@ -132,3 +135,43 @@ def test_full_sequence_filtered_to_device_b_shows_one_row(
     assert (cycle, dev, sent, received) == ("2", "07", "AA BB", "")
     # Ticks are never filtered by device id - status still reflects all 3.
     assert app.window.status_var.get() == "Polling count: 3"
+
+
+def test_raw_log_round_trips_exact_byte_stream(
+    root: tk.Tk, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """STRATEGY.md task 14's core promise, exercised for real: with raw
+    logging on, every byte read - including the poll traffic that never
+    produces a row (SEQUENCE's ticks, none of which appear in
+    EXPECTED_ROWS_UNFILTERED) - lands in the raw log, and concatenating
+    every record's hex field reproduces SEQUENCE exactly, byte for byte."""
+    monkeypatch.setattr("cresnetmon.ui.list_ports", lambda: [])
+    monkeypatch.setattr("cresnetmon.config.load", Settings)
+    monkeypatch.setattr("cresnetmon.app.RawLogWriter", lambda: RawLogWriter(tmp_path))
+    fake_port = _FakePort(SEQUENCE)
+    monkeypatch.setattr("cresnetmon.app.open_port", lambda device: fake_port)
+
+    app = CresnetMonApp(root)
+    app.window.raw_log_var.set(True)
+    app.window.start_button.invoke()
+
+    # Wait for the reader thread to read every byte SEQUENCE holds - the
+    # raw log needs the trailing poll bytes too, not just whatever
+    # produces a row, so waiting on row count (as _run_sequence does)
+    # isn't enough here.
+    deadline = time.time() + 2
+    while fake_port._data and time.time() < deadline:
+        time.sleep(0.005)
+    assert not fake_port._data  # sanity: the fake actually ran dry in time
+    time.sleep(0.05)  # let the last byte's raw_queue.put() land
+
+    app.window.start_button.invoke()  # stop - flushes the trailing chunk
+
+    raw_files = list(tmp_path.glob("*-raw.jsonl"))
+    assert len(raw_files) == 1
+    reassembled = bytearray()
+    for line in raw_files[0].read_text().splitlines():
+        record = json.loads(line)
+        reassembled.extend(bytes.fromhex(record["hex"].replace(" ", "")))
+
+    assert bytes(reassembled) == SEQUENCE

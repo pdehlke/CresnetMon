@@ -125,7 +125,21 @@ that one capture without writing it, but still re-arms.
 This data is meant as ground truth for correlating physical actions with
 the raw bytes they produce on the bus - useful input if you're trying to
 decode what a specific button or command actually does at the protocol
-level.
+level. Each captured frame also records a wall-clock timestamp and the
+exact raw bytes read for that frame (not just the decoded payload), so a
+session can be re-examined later without re-running it.
+
+### Raw log (optional, off by default)
+
+Before clicking **Start**, check **Raw log** to also write every byte read
+from the serial port - decoded or not, including the routine polling
+traffic that never shows up as a row in the table - to
+`mac/captures/<session-start-time>-raw.jsonl`. This is for reconstructing
+the bus's actual polling behavior later, which the normal live view and
+labeled captures both deliberately don't show. It's off by default because
+a long session at 38400 baud produces tens of MB of hex text; only turn it
+on for a deliberate capture session. Like the port and device-ID fields,
+it's read once when you click Start and can't be changed while running.
 
 ## Device labels (seed data)
 
