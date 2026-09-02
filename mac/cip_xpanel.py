@@ -93,8 +93,11 @@ class Listener:
                 self.record("a", body[0] + 1, (body[1] << 8) | body[2])
             elif datatype == 0x15:
                 # Serial with a 2-byte join and one flag byte before the text.
-                # This is the form that carries the AADS's menu labels.
-                self.record("s", (body[0] << 8) | body[1], body[3:].decode("latin-1"))
+                # This is the form that carries the AADS's menu labels. The join
+                # is 0-based on the wire like every other type here, and this
+                # branch was the one place missing the +1: it reported the
+                # TSW-752 panel project's serials one low across the board.
+                self.record("s", ((body[0] << 8) | body[1]) + 1, body[3:].decode("latin-1"))
             elif datatype == 0x02:
                 # Serial the 2009 MC2E uses, self-labelling as "#<join>,<text>".
                 text = body.decode("latin-1")
