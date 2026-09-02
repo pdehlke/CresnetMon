@@ -1,0 +1,11 @@
+{
+  "domain": "crestron_cip",
+  "name": "Crestron CIP Lighting Bridge",
+  "documentation": "https://github.com/pdehlke/homeassistant/blob/main/docs/crestron/crestron-tsw-panel-control-path.md",
+  "codeowners": ["@pdehlke"],
+  "dependencies": [],
+  "requirements": [],
+  "iot_class": "local_push",
+  "config_flow": false,
+  "version": "0.1.0"
+}

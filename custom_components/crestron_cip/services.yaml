@@ -1,0 +1,43 @@
+turn_on:
+  name: Turn on a Crestron load
+  description: >-
+    Turn a lighting load on. The Crestron buttons are toggles, so this presses
+    only when the load's live feedback says it is currently off, then waits for
+    the processor to confirm. Calling it on a load that is already on does
+    nothing.
+  fields:
+    load:
+      name: Load
+      description: The load key, for example office_pool_bath.
+      required: true
+      example: office_pool_bath
+      selector:
+        text:
+
+turn_off:
+  name: Turn off a Crestron load
+  description: >-
+    Turn a lighting load off, with the same press-only-if-needed behaviour as
+    turn_on.
+  fields:
+    load:
+      name: Load
+      description: The load key, for example office_pool_bath.
+      required: true
+      example: office_pool_bath
+      selector:
+        text:
+
+toggle:
+  name: Toggle a Crestron load
+  description: >-
+    Flip a lighting load. Refuses rather than pressing blind if the load's
+    current state is not known.
+  fields:
+    load:
+      name: Load
+      description: The load key, for example office_pool_bath.
+      required: true
+      example: office_pool_bath
+      selector:
+        text:
