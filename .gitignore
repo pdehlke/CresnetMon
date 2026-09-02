@@ -316,3 +316,11 @@ ControlSystem.cfg
 *.spz
 *.lpz
 *.strings.txt
+
+# Python caches outside mac/, which carries its own ignore file. The Home
+# Assistant integration under custom_components/ and its tests are run from the
+# repo root, so their caches land here.
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
