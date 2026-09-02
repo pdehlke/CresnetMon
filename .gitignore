@@ -305,3 +305,14 @@ $RECYCLE.BIN/
 # S# files
 *.projectinfo
 ControlSystem.cfg
+
+# Crestron program artifacts retrieved from a live processor.
+# These are the complete control program for a private residence. Never commit them.
+*.bin
+*.dsc
+*.rte
+*.dip
+*.smw
+*.spz
+*.lpz
+*.strings.txt
