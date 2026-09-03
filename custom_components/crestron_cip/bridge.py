@@ -161,16 +161,17 @@ class CrestronBridge:
                         _LOGGER.debug("%s: confirmed %s on attempt %d", key, want_on, attempt)
                     return
 
+                press_join = load.press_join(want_on)
                 waiter = self._register_waiter(key, want_on)
                 _LOGGER.debug(
                     "%s: pressing d%d to go %s (attempt %d)",
                     key,
-                    load.join,
+                    press_join,
                     "on" if want_on else "off",
                     attempt,
                 )
                 try:
-                    await client.async_press(load.join)
+                    await client.async_press(press_join)
                     await asyncio.wait_for(waiter, CONFIRM_TIMEOUT)
                     return
                 except TimeoutError:
@@ -178,25 +179,29 @@ class CrestronBridge:
                         "%s: no feedback within %.0fs of pressing d%d",
                         key,
                         CONFIRM_TIMEOUT,
-                        load.join,
+                        press_join,
                     )
                 finally:
                     self._drop_waiter(key, waiter)
 
         raise CrestronError(
-            f"{key}: pressed d{load.join} {CONFIRM_ATTEMPTS} times without the "
-            f"processor confirming {'on' if want_on else 'off'}"
+            f"{key}: pressed {CONFIRM_ATTEMPTS} times without the processor "
+            f"confirming {'on' if want_on else 'off'}"
         )
 
     def _guard(self, load: Load) -> None:
         """Refuse to write a join the DSC alarm keypad shares.
 
-        const._validate() already rejects such a table at import, so reaching
-        here means something constructed a Load at runtime. Check anyway: this is
-        the last point before bytes go on the wire.
+        const._validate() already rejects a table containing such a join at
+        import, so reaching here means something constructed a Load at
+        runtime. Check anyway: this is the last point before bytes go on the
+        wire, unconditionally, whether or not this call ends up pressing
+        anything. Checked against every join the load could ever press
+        (`press_joins`), not just its canonical `join`, since press_on/press_off
+        can differ from it.
         """
-        if load.link == LINK_AADS and load.join in FORBIDDEN_AADS_WRITE:
-            raise CrestronError(f"refusing to press d{load.join}: shared with the DSC alarm keypad")
+        if load.link == LINK_AADS and any(j in FORBIDDEN_AADS_WRITE for j in load.press_joins):
+            raise CrestronError(f"refusing to press {load.key}: shared with the DSC alarm keypad")
 
     # ---- confirmation waiters ---------------------------------------------
 

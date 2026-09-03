@@ -42,18 +42,62 @@ FORBIDDEN_AADS_WRITE = frozenset(range(130, 149)) | {93}
 
 @dataclass(frozen=True)
 class Load:
-    """One physical lighting load and the joins that address it."""
+    """One physical lighting load and the joins that address it.
+
+    Every AADS load and most MC2E loads are a single toggle button: `join`
+    both reports state and is the one thing ever pressed, in either
+    direction. That is the default, and `press_on`/`press_off` are left
+    unset.
+
+    A dimmer channel can differ. Island (MC2E `0x72` ch2, identified
+    2026-09-03) has separate on and off buttons in the panel project rather
+    than one toggle, so `join` stays the status/feedback join (what `is_on()`
+    reads) while `press_on`/`press_off` say what to press for each direction.
+    `press_join()` is the one place that resolves what a command actually
+    presses; nothing else should read `press_on`/`press_off` directly. Every
+    MC2E module the Kitchen slot reaches (`0x70`-`0x73`, `0x75`, `0x76`) is a
+    dimmer, so expect more loads to need this shape once the Phase 2 dimmer
+    pass identifies them, not just Island.
+
+    `level_join` records the analog join carrying a dimmer's brightness,
+    where known. The bridge does not act on it yet: brightness is out of
+    scope until Phase 2. It is captured now so that pass does not have to
+    re-derive an identification this project already did.
+    """
 
     key: str
     name: str
     link: str
     join: int | None
     aliases: tuple[int, ...] = field(default=())
+    press_on: int | None = None
+    press_off: int | None = None
+    level_join: int | None = None
 
     @property
     def joins(self) -> tuple[int, ...]:
         """Every join that reports this load's state, canonical one first."""
         return () if self.join is None else (self.join, *self.aliases)
+
+    @property
+    def press_joins(self) -> tuple[int, ...]:
+        """Every join this load could ever have pressed, for safety checks."""
+        return tuple({j for j in (self.join, self.press_on, self.press_off) if j is not None})
+
+    def press_join(self, want_on: bool) -> int:
+        """Which join to press to reach the requested state.
+
+        Toggle loads have no press_on/press_off, so this falls back to `join`
+        for both directions, same as every load behaved before this field
+        existed.
+        """
+        if want_on and self.press_on is not None:
+            return self.press_on
+        if not want_on and self.press_off is not None:
+            return self.press_off
+        if self.join is None:
+            raise ValueError(f"{self.key}: no join mapped, cannot press")
+        return self.join
 
 
 # Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
@@ -101,15 +145,23 @@ _AADS_LOADS: tuple[Load, ...] = (
 # IP-ID 0x03, whose retrieved program contains no alarm, security or access
 # control of any kind.
 #
-# join is None because which XPanel join drives which of these four is not yet
-# established: the press map records channels (0x71 ch4, 0x75 ch0, 0x72 ch3,
-# 0x72 ch2) but ties only 0x71 ch3 to a name. Until the identification pass fills
-# these in, the loads are declared and reported unavailable rather than guessed.
+# Identified live 2026-09-03 (issue #18) by pressing each candidate join on
+# IP-ID 0x03 and watching which Kitchen light responded. Cabinet, Pathway and
+# Range are ordinary toggles, same as every AADS load. Island is not: its
+# channel (0x72 ch2) has a separate raise button (join 27) and a separate
+# single-press fade-to-off button (join 29), with 29 doubling as the on/off
+# status join, so it takes press_on/press_off rather than a bare join. A brief
+# tap of 27 was enough to bring it on to a low, nonzero level (`a22` rose from
+# 0), and the raise/lower joins (27/28) plus the fade timing on 29 mean this
+# channel is genuinely dimmable; brightness stays out of scope here per issue
+# #18, but level_join is recorded so Phase 2 does not have to re-derive it.
+# `0x71` ch3 (raise 22 / lower 23) was left untouched: it is Powder by
+# elimination, already driven from the AADS at d102, and out of scope.
 _MC2E_LOADS: tuple[Load, ...] = (
-    Load("kitchen_range", "Range", LINK_MC2E, None),
-    Load("kitchen_island", "Island", LINK_MC2E, None),
-    Load("kitchen_pathway", "Pathway", LINK_MC2E, None),
-    Load("kitchen_cabinet", "Cabinet", LINK_MC2E, None),
+    Load("kitchen_range", "Range", LINK_MC2E, 26),
+    Load("kitchen_island", "Island", LINK_MC2E, 29, press_on=27, level_join=22),
+    Load("kitchen_pathway", "Pathway", LINK_MC2E, 25),
+    Load("kitchen_cabinet", "Cabinet", LINK_MC2E, 21),
 )
 
 LOADS: tuple[Load, ...] = _AADS_LOADS + _MC2E_LOADS
@@ -119,14 +171,23 @@ LOADS_BY_KEY: dict[str, Load] = {load.key: load for load in LOADS}
 def _validate() -> None:
     """Fail at import rather than at press time if the table is unsafe.
 
-    A canonical join inside the alarm range would otherwise sit dormant in the
-    table until someone turned that light on.
+    A join inside the alarm range would otherwise sit dormant in the table
+    until someone turned that light on. Checked against every join a load
+    could press (`press_joins`), not just its canonical `join`: a load with
+    distinct press_on/press_off, like Island, could otherwise smuggle a
+    forbidden press in through one of those without this catching it.
     """
     seen: dict[tuple[str, int], str] = {}
     for load in LOADS:
-        if load.link == LINK_AADS and load.join in FORBIDDEN_AADS_WRITE:
-            raise ValueError(f"{load.key} presses d{load.join}, which the DSC alarm keypad shares")
+        if load.link == LINK_AADS and any(j in FORBIDDEN_AADS_WRITE for j in load.press_joins):
+            raise ValueError(f"{load.key} presses a join the DSC alarm keypad shares")
         for join in load.joins:
+            owner = seen.setdefault((load.link, join), load.key)
+            if owner != load.key:
+                raise ValueError(f"join {join} on {load.link} claimed by {owner} and {load.key}")
+        for join in (load.press_on, load.press_off):
+            if join is None or join == load.join:
+                continue
             owner = seen.setdefault((load.link, join), load.key)
             if owner != load.key:
                 raise ValueError(f"join {join} on {load.link} claimed by {owner} and {load.key}")

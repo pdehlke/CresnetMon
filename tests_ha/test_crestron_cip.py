@@ -82,16 +82,39 @@ def test_registration_packet_carries_the_ipid():
 def test_table_covers_thirty_loads_and_forty_one_joins():
     assert len(const.LOADS) == 30
     mapped = [load for load in const.LOADS if load.join is not None]
-    assert len(mapped) == 26  # the four Kitchen loads await identification
-    assert sum(len(load.joins) for load in const.LOADS) == 37
-    # 41 worksheet load buttons, less the four unmapped Kitchen joins.
-    assert sum(len(load.joins) for load in const.LOADS) + 4 == 41
+    assert len(mapped) == 30  # all four Kitchen loads identified 2026-09-03
+    # 41 worksheet load buttons. Island counts once here even though pressing
+    # it on takes a second join (press_on): load.joins is feedback joins, and
+    # press_on/press_off deliberately are not feedback joins.
+    assert sum(len(load.joins) for load in const.LOADS) == 41
 
 
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
     for load in const.LOADS:
         if load.link == const.LINK_AADS and load.join is not None:
             assert load.join not in const.FORBIDDEN_AADS_WRITE, load.key
+
+
+def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
+    # 29 of the 30 loads, including three of the four Kitchen ones, are a
+    # single toggle button: press_on/press_off are unset, so press_join()
+    # returns the same join both ways.
+    for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):
+        load = const.LOADS_BY_KEY[key]
+        assert load.press_on is None and load.press_off is None
+        assert load.press_join(True) == load.press_join(False) == load.join
+
+
+def test_island_presses_a_different_join_for_on_than_off():
+    # Identified 2026-09-03: Island's channel has a raise button (27) and a
+    # separate single-press fade-to-off button, and the off button (29) also
+    # doubles as the on/off status join.
+    island = const.LOADS_BY_KEY["kitchen_island"]
+    assert island.join == 29
+    assert island.press_join(True) == 27
+    assert island.press_join(False) == 29
+    assert island.level_join == 22
+    assert set(island.press_joins) == {27, 29}
 
 
 def test_alarm_aliases_are_still_accepted_for_feedback():
@@ -105,6 +128,20 @@ def test_alarm_aliases_are_still_accepted_for_feedback():
 
 def test_validate_rejects_a_forbidden_canonical_join():
     bad = const.Load("boom", "Boom", const.LINK_AADS, 146)
+    original = const.LOADS
+    try:
+        const.LOADS = (*original, bad)
+        with pytest.raises(ValueError, match="alarm keypad"):
+            const._validate()
+    finally:
+        const.LOADS = original
+
+
+def test_validate_rejects_a_forbidden_press_on_even_when_join_is_clean():
+    # A load whose canonical (feedback) join is outside the alarm range can
+    # still smuggle a forbidden press in through press_on/press_off. The
+    # collision check has to look at press_joins, not just `join`.
+    bad = const.Load("boom", "Boom", const.LINK_AADS, 200, press_on=146)
     original = const.LOADS
     try:
         const.LOADS = (*original, bad)
@@ -188,12 +225,22 @@ def test_press_targets_the_canonical_join_never_the_forbidden_alias():
     assert 144 not in aads.presses
 
 
-def test_unmapped_kitchen_loads_refuse_rather_than_guess():
+def test_a_load_with_no_join_mapped_refuses_rather_than_guess():
+    # All thirty loads are mapped now (the Kitchen four, 2026-09-03), so this
+    # exercises the refusal path with a synthetic unmapped load rather than a
+    # real one, the same way the four Kitchen loads worked before identification.
     bridge = make_bridge()
-    assert bridge.is_available("kitchen_range") is False
-    assert bridge.is_on("kitchen_range") is None
-    with pytest.raises(CrestronError, match="no join mapped"):
-        asyncio.run(bridge.async_turn_on("kitchen_range"))
+    ghost = const.Load("ghost", "Ghost", const.LINK_MC2E, None)
+    original = dict(const.LOADS_BY_KEY)
+    try:
+        const.LOADS_BY_KEY["ghost"] = ghost
+        assert bridge.is_available("ghost") is False
+        assert bridge.is_on("ghost") is None
+        with pytest.raises(CrestronError, match="no join mapped"):
+            asyncio.run(bridge.async_turn_on("ghost"))
+    finally:
+        const.LOADS_BY_KEY.clear()
+        const.LOADS_BY_KEY.update(original)
 
 
 def test_a_load_on_a_disconnected_link_refuses():
@@ -235,6 +282,42 @@ def test_toggle_refuses_when_state_is_unknown():
     bridge._clients[const.LINK_AADS].synced = False
     with pytest.raises(CrestronError, match="refusing to toggle blind"):
         asyncio.run(bridge.async_toggle("office_pool_bath"))
+
+
+class FakeIslandClient(FakeClient):
+    """Island's status arrives on a different join (29) than its on button
+    (27), unlike every FakeClient scenario above where the pressed join is
+    also the one that reports. Feedback lands on 29 regardless of which join
+    was pressed, matching what the identification pass found on real
+    hardware: pressing 27 brought the load on and 29 (not 27) went high.
+    """
+
+    async def async_press(self, join, hold=0.0):
+        self.presses.append(join)
+        if self.reply:
+            value = 1 if join == 27 else 0
+            self.digital[29] = value
+            self._bridge._on_digital(self._link, 29, value)
+
+
+def test_island_presses_the_on_join_and_confirms_via_the_status_join():
+    bridge = make_bridge()
+    mc2e = FakeIslandClient()
+    mc2e._bridge, mc2e._link = bridge, const.LINK_MC2E
+    bridge._clients[const.LINK_MC2E] = mc2e
+
+    asyncio.run(bridge.async_turn_on("kitchen_island"))
+    assert mc2e.presses == [27]
+    assert bridge.is_on("kitchen_island") is True
+
+    asyncio.run(bridge.async_turn_off("kitchen_island"))
+    assert mc2e.presses == [27, 29]
+    assert bridge.is_on("kitchen_island") is False
+
+    # Idempotence holds the same way it does for a toggle load, even though
+    # on and off go through different joins here.
+    asyncio.run(bridge.async_turn_off("kitchen_island"))
+    assert mc2e.presses == [27, 29]
 
 
 # ---- service registration -------------------------------------------------
