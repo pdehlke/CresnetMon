@@ -1,8 +1,8 @@
 # HANDOFF — end of 2026-09-01
 
-Point-in-time record. Everything below is either evidence or explicitly labelled
-as unproven. Read "Start here", "What we can control today" and "The open
-question", then dip into the rest as needed.
+Point-in-time record, written 2026-09-01 and amended 2026-09-03. Everything
+below is either evidence or explicitly labelled as unproven. Read "Start here"
+first; it contains a stop sign.
 
 ---
 
@@ -24,6 +24,16 @@ Lights were physically turned on and off this way, confirmed by the owner.
 scanned. Joins 21-35 drive five Kitchen loads; joins 36-95 drive no dimmer at
 all. The `.dsc` describes this panel as `101-Kitchen` and that is literally what
 it is. The path is proven and it does not generalise to the rest of the house.
+
+> **STOP: `IP-ID-03` is no longer free.** As of 2026-09-02 a Home Assistant
+> add-on at `192.168.4.141` (a Proxmox VM) holds that slot and uses it for live
+> Kitchen control. CIP permits one connection per IP-ID, so **every tool in this
+> directory will displace it**: `cip_xpanel.py` defaults to `IPID = 0x03`,
+> `poc_joinpress.py` and `poc_joinscan.py` hard-code `XPANEL_IPID = 0x03`, and
+> `poc_joinwatch.py` spawns `cip_xpanel.py` on it. The add-on reconnects when we
+> disconnect, so the damage is an outage rather than corruption, but do not run
+> any of them against a live house without checking `WHO` first. No code guard
+> exists yet; this warning is all there is.
 
 ---
 
@@ -52,20 +62,34 @@ Joins 36-95 drive nothing. Many of them flip feedback pairs exactly 31 apart
 (`d53`/`d84`, `d54`/`d85`, ...), which looks like page selection on a panel
 whose lighting controls only ever addressed one room.
 
-## The open question
+## The open question, answered elsewhere
 
-**How to reach the other thirteen rooms.** Their loads are wired to keypads and
-touch panels, not to this XPanel slot. Two candidate routes, neither explored:
+**How to reach the other thirteen rooms was solved on 2026-09-02, in a different
+session, by impersonating a TSW-752 touch panel.** That approach is not among the
+two candidates this document originally listed, both of which should be
+disregarded: a hypothetical additional free IP-ID, and evicting the AADS from the
+EISC at `IP-ID-05`.
 
-1. Another free IP-ID with a wider join map. The `.dsc` shows only `IP-ID-03`
-   and `IP-ID-05` on the MC2E, so this may require a slot that does not exist.
-2. The EISC at `Slot-05.IP-ID-05`, which carries whole-house joins (`d58` Entry
-   Center, `d99` Sink Area, `d103` Pool Bath were confirmed on 2026-08-31). It
-   is occupied by the AADS, and displacing it breaks audio and the ST-IO. That
-   is the known blocker and it has not moved.
+What is known here about that work, from the owner rather than from evidence
+gathered in this repo:
 
-Note that the second route is the one with the whole-house join map already
-partly built. It is worth understanding exactly what breaks before dismissing it.
+- it is a Home Assistant add-on, v0.1, running at `192.168.4.141`;
+- most of the integration impersonates one of the TSW-752 touch panels;
+- Kitchen control still goes through the XPanel slot documented below, and
+  folding it into the 752 impersonation is a planned enhancement.
+
+**The alarm reasoning does not transfer to that path.** The finding below that
+there is no alarm in this processor is scoped to the MC2E's compiled program and
+nothing else. `crestron-apex-control-plane.md` in the homeassistant repo places
+the Apex interface on the TSW-752 button joins and the serial commands they send,
+so the surface being impersonated is precisely the one that does reach the alarm.
+Blind join probing was safe against the MC2E; assume it is not safe there.
+
+Open, and genuinely unknown here: which host the 752 impersonation registers
+against. The MC2E's `.dsc` lists only `IP-ID-03` and `IP-ID-05`, so it is
+probably the AADS at `192.168.4.61` rather than the MC2E, which would put the
+Kitchen work and the rest of the house on two different systems. That is an
+inference, not a fact, and it should be confirmed before it is relied on.
 
 ## What is proven
 
@@ -104,6 +128,10 @@ occurrences of alarm, Apex, zone, motion, siren, passcode, panic or intrusion.
 `F-Good Night`, `G-Security`, `H-Entertain`. The worst case of pressing an
 unknown join on this processor is that lights change. This removes the
 constraint that shaped most of the day's caution.
+
+This finding covers **the MC2E and nothing else**. It says nothing about the
+AADS, the TSW-752 panels, or the Apex, and must not be used to justify join
+probing on any of them. See "The open question, answered elsewhere" above.
 
 ---
 
@@ -214,10 +242,10 @@ graduates from proof-of-concept.
 | `crestron_console.py` | telnet console client (port 23), read-only by intent |
 | `ctp_getfile.py` | XMODEM file retrieval over CTP (port 41795) |
 | `sdebug.py` | scoped SDEBUG capture with guaranteed teardown |
-| `cip_xpanel.py` | CIP client, registers on any host/IP-ID, listen-only |
-| `poc_joinwatch.py` | three passive streams while someone presses a keypad |
-| `poc_joinpress.py` | **presses an XPanel join** — the only tool that writes over IP |
-| `poc_joinscan.py` | scans a join range, recording what each one drives |
+| `cip_xpanel.py` | CIP client, registers on any host/IP-ID, listen-only. **Defaults to IP-ID 3** |
+| `poc_joinwatch.py` | three passive streams while someone presses a keypad. **Uses IP-ID 3** |
+| `poc_joinpress.py` | presses an XPanel join, writes over IP. **Uses IP-ID 3** |
+| `poc_joinscan.py` | scans a join range, recording what each one drives. **Uses IP-ID 3** |
 | `poc_witness.py` | asks the processor whether it hears our Cresnet writes |
 | `poc_override.py` | tests whether the processor undoes our Cresnet writes |
 | `poc_inject.py`, `living_pathway.py` | Cresnet injection, superseded, kept as record |
