@@ -96,7 +96,7 @@ def test_no_canonical_join_is_one_the_alarm_keypad_shares():
 
 
 def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
-    # 29 of the 30 loads, including three of the four Kitchen ones, are a
+    # 28 of the 30 loads, including three of the four Kitchen ones, are a
     # single toggle button: press_on/press_off are unset, so press_join()
     # returns the same join both ways.
     for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):
@@ -218,11 +218,26 @@ def test_feedback_on_an_alias_moves_the_load():
 def test_press_targets_the_canonical_join_never_the_forbidden_alias():
     bridge = make_bridge()
     aads = bridge._clients[const.LINK_AADS]
-    asyncio.run(bridge.async_turn_on("dining_room_powder"))
-    assert aads.presses == [102]
-    assert 142 not in aads.presses
     asyncio.run(bridge.async_turn_on("outdoor_kitchen"))
+    assert aads.presses == [104]
     assert 144 not in aads.presses
+
+
+def test_powder_presses_a_different_join_for_on_than_off():
+    # Reported 2026-09-05 and confirmed by pde: d102 confirms feedback but does
+    # not turn on the real fixture, while the Living Rm (d127) and Kitchen
+    # (d142) buttons both do, dimmed. d142 is forbidden to write, so d127 is
+    # the only usable on-join. Off was never broken and stays on d102, same as
+    # before press_on existed.
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+
+    asyncio.run(bridge.async_turn_on("dining_room_powder"))
+    assert aads.presses == [127]
+    assert 142 not in aads.presses
+
+    asyncio.run(bridge.async_turn_off("dining_room_powder"))
+    assert aads.presses == [127, 102]
 
 
 def test_a_load_with_no_join_mapped_refuses_rather_than_guess():

@@ -111,9 +111,18 @@ class Load:
 # is deliberately an alias outside it: Powder presses d102 rather than d142, and
 # Outdoor Kitchen presses d104 rather than d144. Kitchen Perimeter is d103, which
 # lives on the Dining page and was never in the range at all.
+#
+# Powder needs press_on split from its canonical join. Reported 2026-09-05 and
+# confirmed by pde: pressing d102 to go on lights the feedback join but not the
+# real fixture, while the Living Rm (d127) and Kitchen (d142) Powder buttons both
+# turn it on, dimmed. d142 is forbidden to write (Kitchen zone page, alarm range),
+# so d127 is the only working candidate; d102 stays canonical for feedback and for
+# turning off, which was never broken. Same asymmetric-join shape as Island, one
+# load short of Phase 2 rather than a table error. See
+# crestron-ha-bridge.md#powder-needed-its-own-on-join-like-island for the diagnosis.
 _AADS_LOADS: tuple[Load, ...] = (
     Load("dining_room_table", "Table", LINK_AADS, 101),
-    Load("dining_room_powder", "Powder", LINK_AADS, 102, (127, 142)),
+    Load("dining_room_powder", "Powder", LINK_AADS, 102, (127, 142), press_on=127),
     Load("dining_room_north", "North", LINK_AADS, 105),
     Load("dining_room_south", "South", LINK_AADS, 107),
     Load("living_room_pathway", "Pathway", LINK_AADS, 121),
