@@ -100,7 +100,7 @@ class Load:
         return self.join
 
 
-# Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
+# Twenty-five loads reachable through the freed TSW-752 panel slot on the AADS.
 #
 # Where a load appears on several zone pages, the canonical join is the one
 # chosen to press and the aliases only ever report. Outdoor Kitchen is one load
@@ -109,8 +109,15 @@ class Load:
 #
 # Where a load's join would fall inside FORBIDDEN_AADS_WRITE, the canonical join
 # is deliberately an alias outside it: Powder presses d102 rather than d142, and
-# Outdoor Kitchen presses d104 rather than d144. Kitchen Perimeter is d103, which
-# lives on the Dining page and was never in the range at all.
+# Outdoor Kitchen presses d104 rather than d144.
+#
+# d103, labeled "Perimeter" on the Dining page, is not a load of its own.
+# Reported 2026-09-05 and confirmed by pde: it drives the same physical fixture
+# as kitchen_pathway (MC2E join 25), not a separate Kitchen Perimeter light.
+# There used to be a kitchen_perimeter Load here for it; removed rather than
+# turned into an alias, because Load.aliases only covers joins on the same
+# link and this pair spans AADS and MC2E. d103 goes untracked: still a real,
+# harmless button on a real panel, just one HA has no entity for.
 #
 # Powder needs press_on split from its canonical join. Reported 2026-09-05 and
 # confirmed by pde: pressing d102 to go on lights the feedback join but not the
@@ -130,7 +137,6 @@ _AADS_LOADS: tuple[Load, ...] = (
     Load("living_room_ambient", "Ambient", LINK_AADS, 123),
     Load("living_room_east_seating", "East Seating", LINK_AADS, 124),
     Load("living_room_perimeter", "Perimeter", LINK_AADS, 125),
-    Load("kitchen_perimeter", "Perimeter", LINK_AADS, 103),
     Load("outdoor_kitchen", "Outdoor Kitchen", LINK_AADS, 104, (144, 187, 206, 247)),
     Load("courtyard_patio_south", "Patio South", LINK_AADS, 126, (166, 186)),
     Load("courtyard_patio_north", "Patio North", LINK_AADS, 164, (188,)),

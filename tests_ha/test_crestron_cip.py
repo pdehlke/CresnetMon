@@ -79,14 +79,26 @@ def test_registration_packet_carries_the_ipid():
 # ---- load table -----------------------------------------------------------
 
 
-def test_table_covers_thirty_loads_and_forty_one_joins():
-    assert len(const.LOADS) == 30
+def test_table_covers_twenty_nine_loads_and_forty_joins():
+    assert len(const.LOADS) == 29
     mapped = [load for load in const.LOADS if load.join is not None]
-    assert len(mapped) == 30  # all four Kitchen loads identified 2026-09-03
-    # 41 worksheet load buttons. Island counts once here even though pressing
-    # it on takes a second join (press_on): load.joins is feedback joins, and
-    # press_on/press_off deliberately are not feedback joins.
-    assert sum(len(load.joins) for load in const.LOADS) == 41
+    assert len(mapped) == 29  # all four Kitchen loads identified 2026-09-03
+    # 41 worksheet load buttons, minus one: d103 ("Perimeter" on the Dining
+    # page) turned out to drive the same fixture as kitchen_pathway rather
+    # than a load of its own (reported 2026-09-05), and was dropped rather
+    # than kept as a duplicate entity. Island counts once here even though
+    # pressing it on takes a second join (press_on): load.joins is feedback
+    # joins, and press_on/press_off deliberately are not feedback joins.
+    assert sum(len(load.joins) for load in const.LOADS) == 40
+
+
+def test_kitchen_perimeter_is_gone_not_aliased():
+    # It was never a real load, just d103 sharing a name with the Kitchen's
+    # actual Pathway light. No alias can express it: aliases are same-link
+    # joins, and this pair spans AADS (103) and MC2E (kitchen_pathway's 25).
+    assert "kitchen_perimeter" not in const.LOADS_BY_KEY
+    for load in const.LOADS:
+        assert 103 not in load.joins
 
 
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
@@ -96,7 +108,7 @@ def test_no_canonical_join_is_one_the_alarm_keypad_shares():
 
 
 def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
-    # 28 of the 30 loads, including three of the four Kitchen ones, are a
+    # 27 of the 29 loads, including three of the four Kitchen ones, are a
     # single toggle button: press_on/press_off are unset, so press_join()
     # returns the same join both ways.
     for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):
@@ -241,7 +253,7 @@ def test_powder_presses_a_different_join_for_on_than_off():
 
 
 def test_a_load_with_no_join_mapped_refuses_rather_than_guess():
-    # All thirty loads are mapped now (the Kitchen four, 2026-09-03), so this
+    # All twenty-nine loads are mapped now (the Kitchen four, 2026-09-03), so this
     # exercises the refusal path with a synthetic unmapped load rather than a
     # real one, the same way the four Kitchen loads worked before identification.
     bridge = make_bridge()
