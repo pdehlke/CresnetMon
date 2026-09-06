@@ -100,7 +100,7 @@ class Load:
         return self.join
 
 
-# Twenty-five loads reachable through the freed TSW-752 panel slot on the AADS.
+# Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
 #
 # Where a load appears on several zone pages, the canonical join is the one
 # chosen to press and the aliases only ever report. Outdoor Kitchen is one load
@@ -113,11 +113,15 @@ class Load:
 #
 # d103, labeled "Perimeter" on the Dining page, is not a load of its own.
 # Reported 2026-09-05 and confirmed by pde: it drives the same physical fixture
-# as kitchen_pathway (MC2E join 25), not a separate Kitchen Perimeter light.
-# There used to be a kitchen_perimeter Load here for it; removed rather than
-# turned into an alias, because Load.aliases only covers joins on the same
-# link and this pair spans AADS and MC2E. d103 goes untracked: still a real,
-# harmless button on a real panel, just one HA has no entity for.
+# as Kitchen's own Pathway light, not a separate Kitchen Perimeter light. There
+# used to be a kitchen_perimeter Load here for it; removed rather than turned
+# into an alias, because Load.aliases only covers joins on the same link, and
+# this pair spanned AADS (103) and MC2E (kitchen_pathway's old join, 25).
+#
+# Retired the MC2E side of that pair 2026-09-06 (issue #22): d103 sits outside
+# FORBIDDEN_AADS_WRITE and was already proven live to toggle the real fixture
+# (that's how the Kitchen Perimeter mixup was caught in the first place), so
+# kitchen_pathway now presses d103 directly and needs no MC2E join at all.
 #
 # Powder needs press_on split from its canonical join. Reported 2026-09-05 and
 # confirmed by pde: pressing d102 to go on lights the feedback join but not the
@@ -153,29 +157,34 @@ _AADS_LOADS: tuple[Load, ...] = (
     Load("office_north_sink", "North Sink", LINK_AADS, 241),
     Load("office_pool_bath", "Pool Bath", LINK_AADS, 245),
     Load("guest_suite_east_hall", "East Hall", LINK_AADS, 243),
+    Load("kitchen_pathway", "Pathway", LINK_AADS, 103),
 )
 
-# The four Kitchen loads whose only AADS joins (d141, d143, d145, d147) sit
-# inside the alarm range. They are reachable instead through the MC2E XPanel at
-# IP-ID 0x03, whose retrieved program contains no alarm, security or access
-# control of any kind.
+# Three Kitchen loads whose only AADS joins (d141, d143, d147) sit inside the
+# alarm range and have no safe alias anywhere in the panel project. They are
+# reachable instead through the MC2E XPanel at IP-ID 0x03, whose retrieved
+# program contains no alarm, security or access control of any kind.
 #
 # Identified live 2026-09-03 (issue #18) by pressing each candidate join on
-# IP-ID 0x03 and watching which Kitchen light responded. Cabinet, Pathway and
-# Range are ordinary toggles, same as every AADS load. Island is not: its
-# channel (0x72 ch2) has a separate raise button (join 27) and a separate
-# single-press fade-to-off button (join 29), with 29 doubling as the on/off
-# status join, so it takes press_on/press_off rather than a bare join. A brief
-# tap of 27 was enough to bring it on to a low, nonzero level (`a22` rose from
-# 0), and the raise/lower joins (27/28) plus the fade timing on 29 mean this
-# channel is genuinely dimmable; brightness stays out of scope here per issue
-# #18, but level_join is recorded so Phase 2 does not have to re-derive it.
+# IP-ID 0x03 and watching which Kitchen light responded. Cabinet and Range are
+# ordinary toggles, same as every AADS load. Island is not: its channel
+# (0x72 ch2) has a separate raise button (join 27) and a separate single-press
+# fade-to-off button (join 29), with 29 doubling as the on/off status join, so
+# it takes press_on/press_off rather than a bare join. A brief tap of 27 was
+# enough to bring it on to a low, nonzero level (`a22` rose from 0), and the
+# raise/lower joins (27/28) plus the fade timing on 29 mean this channel is
+# genuinely dimmable; brightness stays out of scope here per issue #18, but
+# level_join is recorded so Phase 2 does not have to re-derive it.
 # `0x71` ch3 (raise 22 / lower 23) was left untouched: it is Powder by
 # elimination, already driven from the AADS at d102, and out of scope.
+#
+# A fourth Kitchen load, Pathway, was identified on this same slot (join 25)
+# but has since moved to _AADS_LOADS: unlike Range, Island and Cabinet, its
+# join (d145) has a safe alias elsewhere in the panel project (d103), so it
+# needs no MC2E join at all. See _AADS_LOADS's own comment and issue #22.
 _MC2E_LOADS: tuple[Load, ...] = (
     Load("kitchen_range", "Range", LINK_MC2E, 26),
     Load("kitchen_island", "Island", LINK_MC2E, 29, press_on=27, level_join=22),
-    Load("kitchen_pathway", "Pathway", LINK_MC2E, 25),
     Load("kitchen_cabinet", "Cabinet", LINK_MC2E, 21),
 )
 

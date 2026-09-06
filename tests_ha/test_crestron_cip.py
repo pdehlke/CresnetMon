@@ -85,20 +85,38 @@ def test_table_covers_twenty_nine_loads_and_forty_joins():
     assert len(mapped) == 29  # all four Kitchen loads identified 2026-09-03
     # 41 worksheet load buttons, minus one: d103 ("Perimeter" on the Dining
     # page) turned out to drive the same fixture as kitchen_pathway rather
-    # than a load of its own (reported 2026-09-05), and was dropped rather
-    # than kept as a duplicate entity. Island counts once here even though
-    # pressing it on takes a second join (press_on): load.joins is feedback
-    # joins, and press_on/press_off deliberately are not feedback joins.
+    # than a load of its own (reported 2026-09-05). It isn't a second,
+    # duplicate entity, but it is exactly the join kitchen_pathway itself now
+    # presses (moved off the MC2E 2026-09-06, issue #22), so it still counts
+    # once, just under a different load's key than the worksheet's own "d103
+    # Perimeter" row. Island counts once here even though pressing it on
+    # takes a second join (press_on): load.joins is feedback joins, and
+    # press_on/press_off deliberately are not feedback joins.
     assert sum(len(load.joins) for load in const.LOADS) == 40
 
 
 def test_kitchen_perimeter_is_gone_not_aliased():
     # It was never a real load, just d103 sharing a name with the Kitchen's
-    # actual Pathway light. No alias can express it: aliases are same-link
-    # joins, and this pair spans AADS (103) and MC2E (kitchen_pathway's 25).
+    # actual Pathway light. No alias could express it: aliases are same-link
+    # joins, and this pair used to span AADS (103) and MC2E (kitchen_pathway's
+    # old join, 25). d103 is now kitchen_pathway's own canonical join instead
+    # (issue #22), not an alias and not a second entity.
     assert "kitchen_perimeter" not in const.LOADS_BY_KEY
+    pathway = const.LOADS_BY_KEY["kitchen_pathway"]
+    assert pathway.link == const.LINK_AADS
+    assert pathway.join == 103
     for load in const.LOADS:
-        assert 103 not in load.joins
+        if load.key != "kitchen_pathway":
+            assert 103 not in load.joins
+
+
+def test_kitchen_pathway_no_longer_needs_the_mc2e():
+    # Retired 2026-09-06 (issue #22): unlike Range, Island and Cabinet, whose
+    # only AADS joins collide with the alarm range and have no safe alias
+    # anywhere in the panel project, Pathway's d145 does have one (d103), so
+    # it moved to _AADS_LOADS and dropped its MC2E join entirely.
+    mc2e_keys = {load.key for load in const.LOADS if load.link == const.LINK_MC2E}
+    assert mc2e_keys == {"kitchen_range", "kitchen_island", "kitchen_cabinet"}
 
 
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
