@@ -100,7 +100,7 @@ class Load:
         return self.join
 
 
-# Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
+# Twenty-seven loads reachable through the freed TSW-752 panel slot on the AADS.
 #
 # Where a load appears on several zone pages, the canonical join is the one
 # chosen to press and the aliases only ever report. Outdoor Kitchen is one load
@@ -122,6 +122,17 @@ class Load:
 # FORBIDDEN_AADS_WRITE and was already proven live to toggle the real fixture
 # (that's how the Kitchen Perimeter mixup was caught in the first place), so
 # kitchen_pathway now presses d103 directly and needs no MC2E join at all.
+#
+# d221 ("Holiday" on the Modes page, LIGHT-pg01-zn07) was categorised as a
+# scene button, not a load, in the original 2026-09-02 worksheet pass. pde
+# traced it physically on 2026-09-06 and found it switches a real fixture, the
+# outdoor eave receptacles used for holiday lights, not a macro over other
+# loads. Reclassified as an ordinary Outside load on that basis (issue #19).
+# Security, Vacation and Party, the other three Modes buttons issue #19
+# originally grouped with Holiday, are unresolved and stay untracked: pde saw
+# no visible effect from any of them at a physical panel, and it is still open
+# whether they do nothing in this installation, do something not visually
+# obvious, or have non-independent feedback the way Goodbye and Good Night do.
 #
 # Powder needs press_on split from its canonical join. Reported 2026-09-05 and
 # confirmed by pde: pressing d102 to go on lights the feedback join but not the
@@ -154,6 +165,7 @@ _AADS_LOADS: tuple[Load, ...] = (
     Load("entry_perimeter", "Entry Perimeter", LINK_AADS, 184),
     Load("outside_home_perimeter", "Home Perimeter", LINK_AADS, 183, (246,)),
     Load("outside_garage_sconces", "Garage Sconces", LINK_AADS, 185, (244,)),
+    Load("outside_holiday", "Holiday", LINK_AADS, 221),
     Load("office_north_sink", "North Sink", LINK_AADS, 241),
     Load("office_pool_bath", "Pool Bath", LINK_AADS, 245),
     Load("guest_suite_east_hall", "East Hall", LINK_AADS, 243),

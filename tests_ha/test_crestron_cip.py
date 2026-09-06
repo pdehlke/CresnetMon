@@ -79,20 +79,19 @@ def test_registration_packet_carries_the_ipid():
 # ---- load table -----------------------------------------------------------
 
 
-def test_table_covers_twenty_nine_loads_and_forty_joins():
-    assert len(const.LOADS) == 29
+def test_table_covers_thirty_loads_and_forty_one_joins():
+    assert len(const.LOADS) == 30
     mapped = [load for load in const.LOADS if load.join is not None]
-    assert len(mapped) == 29  # all four Kitchen loads identified 2026-09-03
-    # 41 worksheet load buttons, minus one: d103 ("Perimeter" on the Dining
-    # page) turned out to drive the same fixture as kitchen_pathway rather
-    # than a load of its own (reported 2026-09-05). It isn't a second,
-    # duplicate entity, but it is exactly the join kitchen_pathway itself now
-    # presses (moved off the MC2E 2026-09-06, issue #22), so it still counts
-    # once, just under a different load's key than the worksheet's own "d103
-    # Perimeter" row. Island counts once here even though pressing it on
-    # takes a second join (press_on): load.joins is feedback joins, and
+    assert len(mapped) == 30  # all four Kitchen loads identified 2026-09-03
+    # 42 worksheet load buttons (41 plus Holiday, reclassified from scene to
+    # load 2026-09-06), minus one: d145, Kitchen's own "Pathway" button, sits
+    # inside the forbidden alarm range and is no longer referenced by anything
+    # now that kitchen_pathway presses its safe alias (d103) directly instead
+    # (issue #22). d103 itself is not the gap; it is kitchen_pathway's own
+    # canonical join. Island counts once here even though pressing it on takes
+    # a second join (press_on): load.joins is feedback joins, and
     # press_on/press_off deliberately are not feedback joins.
-    assert sum(len(load.joins) for load in const.LOADS) == 40
+    assert sum(len(load.joins) for load in const.LOADS) == 41
 
 
 def test_kitchen_perimeter_is_gone_not_aliased():
@@ -119,6 +118,22 @@ def test_kitchen_pathway_no_longer_needs_the_mc2e():
     assert mc2e_keys == {"kitchen_range", "kitchen_island", "kitchen_cabinet"}
 
 
+def test_holiday_is_a_real_outside_load_not_a_dead_scene_button():
+    # d221 ("Holiday" on the Modes page) was categorised as a scene in the
+    # 2026-09-02 worksheet pass. pde traced it physically 2026-09-06 and found
+    # it switches the outdoor eave receptacles used for holiday lights, an
+    # ordinary toggle like any other AADS load (issue #19). Security, Vacation
+    # and Party, the other three Modes buttons issue #19 grouped it with,
+    # remain unconfirmed and are deliberately absent from this table.
+    holiday = const.LOADS_BY_KEY["outside_holiday"]
+    assert holiday.link == const.LINK_AADS
+    assert holiday.join == 221
+    assert holiday.press_on is None and holiday.press_off is None
+    assert 221 not in const.FORBIDDEN_AADS_WRITE
+    for key in ("outside_security", "outside_vacation", "outside_party"):
+        assert key not in const.LOADS_BY_KEY
+
+
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
     for load in const.LOADS:
         if load.link == const.LINK_AADS and load.join is not None:
@@ -126,7 +141,7 @@ def test_no_canonical_join_is_one_the_alarm_keypad_shares():
 
 
 def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
-    # 27 of the 29 loads, including three of the four Kitchen ones, are a
+    # 28 of the 30 loads, including three of the four Kitchen ones, are a
     # single toggle button: press_on/press_off are unset, so press_join()
     # returns the same join both ways.
     for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):
@@ -271,7 +286,7 @@ def test_powder_presses_a_different_join_for_on_than_off():
 
 
 def test_a_load_with_no_join_mapped_refuses_rather_than_guess():
-    # All twenty-nine loads are mapped now (the Kitchen four, 2026-09-03), so this
+    # All thirty loads are mapped now (the Kitchen four, 2026-09-03), so this
     # exercises the refusal path with a synthetic unmapped load rather than a
     # real one, the same way the four Kitchen loads worked before identification.
     bridge = make_bridge()
