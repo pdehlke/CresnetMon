@@ -79,10 +79,10 @@ def test_registration_packet_carries_the_ipid():
 # ---- load table -----------------------------------------------------------
 
 
-def test_table_covers_thirty_loads_and_forty_one_joins():
-    assert len(const.LOADS) == 30
+def test_table_covers_twenty_nine_loads_and_forty_one_joins():
+    assert len(const.LOADS) == 29
     mapped = [load for load in const.LOADS if load.join is not None]
-    assert len(mapped) == 30  # all four Kitchen loads identified 2026-09-03
+    assert len(mapped) == 29  # all four Kitchen loads identified 2026-09-03
     # 42 worksheet load buttons (41 plus Holiday, reclassified from scene to
     # load 2026-09-06), minus one: d145, Kitchen's own "Pathway" button, sits
     # inside the forbidden alarm range and is no longer referenced by anything
@@ -90,7 +90,10 @@ def test_table_covers_thirty_loads_and_forty_one_joins():
     # (issue #22). d103 itself is not the gap; it is kitchen_pathway's own
     # canonical join. Island counts once here even though pressing it on takes
     # a second join (press_on): load.joins is feedback joins, and
-    # press_on/press_off deliberately are not feedback joins.
+    # press_on/press_off deliberately are not feedback joins. The join total
+    # is unchanged at 41 even though the load count dropped 30 -> 29: folding
+    # outside_home_perimeter into entry_door (2026-09-06) merged two Loads'
+    # joins onto one, it did not remove either d183 or d246 from the table.
     assert sum(len(load.joins) for load in const.LOADS) == 41
 
 
@@ -134,6 +137,27 @@ def test_holiday_is_a_real_outside_load_not_a_dead_scene_button():
         assert key not in const.LOADS_BY_KEY
 
 
+def test_home_perimeter_was_a_second_name_for_the_door_not_a_fixture():
+    # outside_home_perimeter (d183, alias d246) never drove a distinct load.
+    # pde traced the real Foyer keypad button for Home Perimeter on 2026-09-06
+    # and found it lights the same garage dimmer LED as Door (d181), and
+    # separately confirmed pressing d183/d246 does too. Folded into entry_door
+    # as aliases rather than kept as a second Load, same treatment Kitchen
+    # Perimeter got for the same reason (homeassistant issue #23).
+    # The load that button actually operates is not expressible here at all:
+    # it lives on Cresnet device 0x74 (a CLX-4HSW4), Digital Join 3, outside
+    # the join space either CIP connection can reach.
+    assert "outside_home_perimeter" not in const.LOADS_BY_KEY
+    door = const.LOADS_BY_KEY["entry_door"]
+    assert door.link == const.LINK_AADS
+    assert door.join == 181
+    assert set(door.joins) == {181, 183, 246}
+    for load in const.LOADS:
+        if load.key != "entry_door":
+            assert 183 not in load.joins
+            assert 246 not in load.joins
+
+
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
     for load in const.LOADS:
         if load.link == const.LINK_AADS and load.join is not None:
@@ -141,7 +165,7 @@ def test_no_canonical_join_is_one_the_alarm_keypad_shares():
 
 
 def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
-    # 28 of the 30 loads, including three of the four Kitchen ones, are a
+    # 27 of the 29 loads, including three of the four Kitchen ones, are a
     # single toggle button: press_on/press_off are unset, so press_join()
     # returns the same join both ways.
     for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):
@@ -286,7 +310,7 @@ def test_powder_presses_a_different_join_for_on_than_off():
 
 
 def test_a_load_with_no_join_mapped_refuses_rather_than_guess():
-    # All thirty loads are mapped now (the Kitchen four, 2026-09-03), so this
+    # All twenty-nine loads are mapped now (the Kitchen four, 2026-09-03), so this
     # exercises the refusal path with a synthetic unmapped load rather than a
     # real one, the same way the four Kitchen loads worked before identification.
     bridge = make_bridge()

@@ -100,7 +100,7 @@ class Load:
         return self.join
 
 
-# Twenty-seven loads reachable through the freed TSW-752 panel slot on the AADS.
+# Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
 #
 # Where a load appears on several zone pages, the canonical join is the one
 # chosen to press and the aliases only ever report. Outdoor Kitchen is one load
@@ -134,6 +134,21 @@ class Load:
 # whether they do nothing in this installation, do something not visually
 # obvious, or have non-independent feedback the way Goodbye and Good Night do.
 #
+# outside_home_perimeter (d183, alias d246) never was a distinct fixture. pde
+# found the real Foyer keypad button for Home Perimeter on 2026-09-06, and it
+# does not touch either digital join at all: watching the crestron_cip bridge's
+# own raw join trace while it was pressed showed nothing but the Goodbye/Good
+# Night "everything's off" tell moving. Pressing d183/d246 directly, separately,
+# showed the same garage dimmer LED lighting up as pressing Door (d181) does.
+# So this Load was a second name for entry_door, not a fixture of its own; its
+# joins are folded into entry_door as aliases below. The real Home Perimeter
+# turned out to live entirely outside the join space either CIP connection can
+# reach at all: Cresnet device 0x74 (a CLX-4HSW4, "reports Digital Joins
+# instead" per crestron-migration.md, unlike every dimmer module), Digital
+# Join 3, confirmed by name over the MC2E's own console (SDEBUG), not
+# something a Load here can express. See homeassistant issue #23 for the full
+# trace and why that join cannot be wired up without new SIMPL program logic.
+#
 # Powder needs press_on split from its canonical join. Reported 2026-09-05 and
 # confirmed by pde: pressing d102 to go on lights the feedback join but not the
 # real fixture, while the Living Rm (d127) and Kitchen (d142) Powder buttons both
@@ -160,10 +175,9 @@ _AADS_LOADS: tuple[Load, ...] = (
     Load("primary_suite_bed_diagonal", "Bed Diagonal", LINK_AADS, 163),
     Load("primary_suite_bath_perimeter", "Bath Perimeter", LINK_AADS, 165),
     Load("primary_suite_bath_diagonal", "Bath Diagonal", LINK_AADS, 167),
-    Load("entry_door", "Door", LINK_AADS, 181),
+    Load("entry_door", "Door", LINK_AADS, 181, (183, 246)),
     Load("entry_center", "Entry Center", LINK_AADS, 182),
     Load("entry_perimeter", "Entry Perimeter", LINK_AADS, 184),
-    Load("outside_home_perimeter", "Home Perimeter", LINK_AADS, 183, (246,)),
     Load("outside_garage_sconces", "Garage Sconces", LINK_AADS, 185, (244,)),
     Load("outside_holiday", "Holiday", LINK_AADS, 221),
     Load("office_north_sink", "North Sink", LINK_AADS, 241),
