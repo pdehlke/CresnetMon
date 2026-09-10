@@ -79,10 +79,10 @@ def test_registration_packet_carries_the_ipid():
 # ---- load table -----------------------------------------------------------
 
 
-def test_table_covers_twenty_nine_loads_and_forty_one_joins():
-    assert len(const.LOADS) == 29
+def test_table_covers_thirty_five_loads_and_forty_seven_joins():
+    assert len(const.LOADS) == 35
     mapped = [load for load in const.LOADS if load.join is not None]
-    assert len(mapped) == 29  # all four Kitchen loads identified 2026-09-03
+    assert len(mapped) == 35  # all four Kitchen loads identified 2026-09-03
     # 42 worksheet load buttons (41 plus Holiday, reclassified from scene to
     # load 2026-09-06), minus one: d145, Kitchen's own "Pathway" button, sits
     # inside the forbidden alarm range and is no longer referenced by anything
@@ -91,10 +91,12 @@ def test_table_covers_twenty_nine_loads_and_forty_one_joins():
     # canonical join. Island counts once here even though pressing it on takes
     # a second join (press_on): load.joins is feedback joins, and
     # press_on/press_off deliberately are not feedback joins. The join total
-    # is unchanged at 41 even though the load count dropped 30 -> 29: folding
-    # outside_home_perimeter into entry_door (2026-09-06) merged two Loads'
-    # joins onto one, it did not remove either d183 or d246 from the table.
-    assert sum(len(load.joins) for load in const.LOADS) == 41
+    # was 41 with the load count at 29: folding outside_home_perimeter into
+    # entry_door (2026-09-06) merged two Loads' joins onto one, it did not
+    # remove either d183 or d246 from the table. 2026-09-10 added six Patio
+    # scene buttons (Path, Night, Fiesta, Patio All On, Club, Pool), each a
+    # single-join toggle with no alias, so both counts rise by exactly six.
+    assert sum(len(load.joins) for load in const.LOADS) == 47
 
 
 def test_kitchen_perimeter_is_gone_not_aliased():
@@ -158,6 +160,37 @@ def test_home_perimeter_was_a_second_name_for_the_door_not_a_fixture():
             assert 246 not in load.joins
 
 
+def test_patio_scene_buttons_are_opaque_macro_loads():
+    # d201-d205 and d207 (Path, Night, Fiesta, Patio All On, Club, Pool) were
+    # scene buttons in the 2026-09-02 worksheet pass. A CIP-only trace on
+    # 2026-09-10 undercounted what they do; pde confirmed by direct, on-site
+    # observation that each is real and drives several fixtures, some of
+    # which never surface on any join CIP can see at all (same class of gap
+    # as outside_home_perimeter above). pde's call: wire each up as one
+    # opaque macro rather than chase down every fixture inside it, since he
+    # plans to use these as whole scenes in future automations rather than
+    # address their contents separately.
+    scenes = {
+        "courtyard_path": 201,
+        "courtyard_night": 202,
+        "courtyard_fiesta": 203,
+        "courtyard_patio_all_on": 204,
+        "courtyard_club": 205,
+        "courtyard_pool": 207,
+    }
+    for key, join in scenes.items():
+        load = const.LOADS_BY_KEY[key]
+        assert load.link == const.LINK_AADS
+        assert load.join == join
+        assert load.press_on is None and load.press_off is None
+        assert load.press_join(True) == load.press_join(False) == join
+        assert join not in const.FORBIDDEN_AADS_WRITE
+    # courtyard_pool (d207, the Patio page's "Pool" scene) and office_pool_bath
+    # (d245, the Others page's "Pool Bath" load) are unrelated fixtures with
+    # similar names; guard against them ever getting collapsed into one join.
+    assert const.LOADS_BY_KEY["courtyard_pool"].join != const.LOADS_BY_KEY["office_pool_bath"].join
+
+
 def test_no_canonical_join_is_one_the_alarm_keypad_shares():
     for load in const.LOADS:
         if load.link == const.LINK_AADS and load.join is not None:
@@ -165,7 +198,7 @@ def test_no_canonical_join_is_one_the_alarm_keypad_shares():
 
 
 def test_press_join_falls_back_to_the_canonical_join_for_ordinary_toggles():
-    # 27 of the 29 loads, including three of the four Kitchen ones, are a
+    # 33 of the 35 loads, including three of the four Kitchen ones, are a
     # single toggle button: press_on/press_off are unset, so press_join()
     # returns the same join both ways.
     for key in ("office_pool_bath", "kitchen_range", "kitchen_pathway", "kitchen_cabinet"):

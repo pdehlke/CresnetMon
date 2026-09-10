@@ -100,7 +100,8 @@ class Load:
         return self.join
 
 
-# Twenty-six loads reachable through the freed TSW-752 panel slot on the AADS.
+# Thirty-two loads reachable through the freed TSW-752 panel slot on the AADS (twenty-six
+# ordinary loads plus the six Patio-page scene-button macros added 2026-09-10, below).
 #
 # Where a load appears on several zone pages, the canonical join is the one
 # chosen to press and the aliases only ever report. Outdoor Kitchen is one load
@@ -133,6 +134,23 @@ class Load:
 # no visible effect from any of them at a physical panel, and it is still open
 # whether they do nothing in this installation, do something not visually
 # obvious, or have non-independent feedback the way Goodbye and Good Night do.
+#
+# The Patio page's six scene buttons (d201-d205, d207; d206 "Outdoor Kitchen"
+# is the page's one ordinary load, already above) got a CIP-only trace on
+# 2026-09-10 that undercounted what they actually do. pde confirmed by direct,
+# on-site observation that each is a real, working combination of fixtures,
+# several of which (the courtyard's four corners, the patio sconces, the south
+# pathway) never show up on any join the panel reports back over CIP at all --
+# the same class of gap outside_home_perimeter below is the precedent for.
+# pde's call: wire each button up as one opaque macro Load rather than chase
+# down every individual fixture inside it, since he expects to use these as
+# whole scenes in future automations rather than address their contents
+# separately. Each one's `join` is its own indicator, which behaves as genuine
+# on/off feedback -- it clears on Area Off or when a different button in the
+# same mutually-exclusive scene-selector group takes over -- so these press
+# the same way any other toggle Load does, no press_on/press_off split needed.
+# Full history in the pdehlke/homeassistant repo's
+# crestron-load-room-worksheet.md, Patio section.
 #
 # outside_home_perimeter (d183, alias d246) never was a distinct fixture. pde
 # found the real Foyer keypad button for Home Perimeter on 2026-09-06, and it
@@ -170,6 +188,12 @@ _AADS_LOADS: tuple[Load, ...] = (
     Load("outdoor_kitchen", "Outdoor Kitchen", LINK_AADS, 104, (144, 187, 206, 247)),
     Load("courtyard_patio_south", "Patio South", LINK_AADS, 126, (166, 186)),
     Load("courtyard_patio_north", "Patio North", LINK_AADS, 164, (188,)),
+    Load("courtyard_path", "Path", LINK_AADS, 201),
+    Load("courtyard_night", "Night", LINK_AADS, 202),
+    Load("courtyard_fiesta", "Fiesta", LINK_AADS, 203),
+    Load("courtyard_patio_all_on", "Patio (All On)", LINK_AADS, 204),
+    Load("courtyard_club", "Club", LINK_AADS, 205),
+    Load("courtyard_pool", "Pool", LINK_AADS, 207),
     Load("primary_suite_bed_perimeter", "Bed Perimeter", LINK_AADS, 161),
     Load("primary_suite_hallway", "Hallway", LINK_AADS, 162),
     Load("primary_suite_bed_diagonal", "Bed Diagonal", LINK_AADS, 163),
