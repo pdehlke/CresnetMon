@@ -76,11 +76,13 @@ class CipClient:
         ipid: int,
         on_digital: Callable[[int, int], None],
         on_state: Callable[[], None] | None = None,
+        entry_join: int | None = None,
     ) -> None:
         self.name = name
         self.host = host
         self.port = port
         self.ipid = ipid
+        self.entry_join = entry_join
         self._on_digital = on_digital
         self._on_state = on_state
 
@@ -90,6 +92,7 @@ class CipClient:
 
         self.connected = False
         self.synced = False
+        self._entered = False
 
         self._writer: asyncio.StreamWriter | None = None
         self._task: asyncio.Task | None = None
@@ -152,6 +155,7 @@ class CipClient:
         self._writer = writer
         self.connected = True
         self.synced = False
+        self._entered = False
         # State from a previous session is not evidence about this one. Anything
         # that changed while we were away arrives in the new dump, and anything
         # that did not is re-asserted by it.
@@ -185,16 +189,39 @@ class CipClient:
             # nothing to say would never send it, so quiet also counts as synced.
             quiet_for = loop.time() - self._last_rx
             if self.connected and not self.synced and quiet_for > SYNC_QUIET_SECONDS:
-                self._mark_synced()
+                await self._mark_synced()
 
             now = loop.time()
             if now - last_beat >= HEARTBEAT_INTERVAL:
                 await self._send(HEARTBEAT)
                 last_beat = now
 
-    def _mark_synced(self) -> None:
+    async def _mark_synced(self) -> None:
+        """Finish coming up, entering the gated subsystem first where there is one.
+
+        A registered slot is not yet a useful one on the AADS. The processor
+        hands it the menu and then waits for the panel to say which subsystem it
+        is showing; until that press arrives it reports no lighting joins and
+        acts on none. Reaching `synced` on the strength of the menu dump alone
+        would therefore have the bridge report every load off, confidently and
+        wrongly, so the entry press happens first and the session is only synced
+        once the subsystem's own dump has landed behind it.
+
+        Resetting `_last_rx` matters: the caller reached here because the link
+        had gone quiet, and without it the very next pass through the read loop
+        would call this again and sync on the pre-entry state.
+        """
         if self.synced:
             return
+        if self.entry_join is not None and not self._entered:
+            self._entered = True
+            _LOGGER.info(
+                "%s: entering the lighting subsystem on d%d", self.name, self.entry_join
+            )
+            await self.async_press(self.entry_join)
+            self._last_rx = asyncio.get_running_loop().time()
+            return
+
         self.synced = True
         _LOGGER.info(
             "%s: synced, %d digital joins reported (%d high), %d analog, %d serial",
@@ -204,6 +231,16 @@ class CipClient:
             len(self.analog),
             len(self.serial),
         )
+        if self.entry_join is not None and not self.digital:
+            # The one failure this link has ever had looks exactly like a quiet
+            # house from in here, so say it out loud rather than let thirty
+            # loads report off on the strength of an empty dump.
+            _LOGGER.warning(
+                "%s: no digital joins after pressing d%d, the lighting subsystem "
+                "probably did not open and every load will read off",
+                self.name,
+                self.entry_join,
+            )
         if self._on_state:
             self._on_state()
 
@@ -261,7 +298,7 @@ class CipClient:
         elif datatype == 0x03 and body and body[0] == 0x1C:
             await self._send(END_OF_QUERY_ACK)
             await self._send(HEARTBEAT)
-            self._mark_synced()
+            await self._mark_synced()
 
     # ---- writing -----------------------------------------------------------
 

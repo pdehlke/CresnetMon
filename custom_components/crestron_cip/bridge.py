@@ -62,6 +62,7 @@ class CrestronBridge:
                 host=settings["host"],
                 port=settings.get("port", CIP_PORT),
                 ipid=settings["ipid"],
+                entry_join=settings.get("entry_join"),
                 on_digital=lambda join, value, _link=link: self._on_digital(_link, join, value),
                 on_state=self._notify,
             )

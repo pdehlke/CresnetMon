@@ -20,9 +20,27 @@ CIP_PORT = 41794
 LINK_AADS = "aads"
 LINK_MC2E = "mc2e"
 
+# d91 is the panel project's Lights subsystem-entry button, the one a person taps
+# on the home page before any load button is on screen. The AADS gates the whole
+# lighting subsystem on it, per slot: until a registered slot presses it, the
+# processor sends that slot its menu and nothing else, reports no lighting joins
+# at all, and silently ignores every load join pressed at it.
+#
+# Nothing had to send it for the first five weeks this bridge ran, because the
+# AADS program had been up continuously since before panel 13 was unplugged and
+# still held that panel latched inside the subsystem. A house power cut on
+# 2026-09-15 restarted the program, cleared the latch, and every AADS load went
+# dead while the Cresnet keypads and the MC2E's own Kitchen slot kept working.
+# Diagnosis and the live proof are in the pdehlke/homeassistant repo at
+# docs/crestron/crestron-lights-subsystem-gating.md.
+#
+# d93 is the same kind of button for the Alarm subsystem. Never press that one:
+# it is in FORBIDDEN_AADS_WRITE below for exactly that reason.
+LIGHTS_ENTRY_JOIN = 91
+
 DEFAULTS = {
-    LINK_AADS: {"host": "192.168.4.61", "ipid": 0x13},
-    LINK_MC2E: {"host": "192.168.4.59", "ipid": 0x03},
+    LINK_AADS: {"host": "192.168.4.61", "ipid": 0x13, "entry_join": LIGHTS_ENTRY_JOIN},
+    LINK_MC2E: {"host": "192.168.4.59", "ipid": 0x03, "entry_join": None},
 }
 
 # The DSC alarm keypad page (5-SEC / ALARM-DSC-pg01-main) reuses this join range
@@ -251,6 +269,9 @@ def _validate() -> None:
     distinct press_on/press_off, like Island, could otherwise smuggle a
     forbidden press in through one of those without this catching it.
     """
+    if LIGHTS_ENTRY_JOIN in FORBIDDEN_AADS_WRITE:
+        raise ValueError("the lighting subsystem-entry join is one the DSC alarm keypad shares")
+
     seen: dict[tuple[str, int], str] = {}
     for load in LOADS:
         if load.link == LINK_AADS and any(j in FORBIDDEN_AADS_WRITE for j in load.press_joins):

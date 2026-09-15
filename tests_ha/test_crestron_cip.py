@@ -458,3 +458,95 @@ def test_services_are_not_registered_with_lambdas():
         if "async_register" in line and "lambda" in line:
             raise AssertionError(f"service registered with a lambda handler: {line.strip()}")
     assert "def _service(" in source, "expected the async-def handler factory to still exist"
+
+
+# ---- lighting subsystem gating --------------------------------------------
+
+
+def _client(entry_join):
+    client = _cip_mod.CipClient(
+        name="test",
+        host="127.0.0.1",
+        port=const.CIP_PORT,
+        ipid=0x13,
+        on_digital=lambda join, value: None,
+        entry_join=entry_join,
+    )
+    client.connected = True
+    client.presses = []
+
+    async def _press(join, hold=0.0):
+        client.presses.append(join)
+
+    client.async_press = _press
+    return client
+
+
+def test_the_aads_link_enters_the_lighting_subsystem_before_it_calls_itself_synced():
+    """The failure this guards against is silent and looks exactly like a dark house.
+
+    A slot the AADS has registered but not admitted to the Lights subsystem
+    reports no lighting joins at all, so syncing on that dump would have every
+    load read off and every press ignored. That is what a power cut produced on
+    2026-09-15. The entry press has to come first, and `synced` has to wait for
+    what it brings back.
+    """
+    client = _client(const.LIGHTS_ENTRY_JOIN)
+
+    async def scenario():
+        await client._mark_synced()
+        assert client.presses == [const.LIGHTS_ENTRY_JOIN]
+        assert client.synced is False, "synced before the subsystem's own dump landed"
+
+        # The joins the entry press shook loose, then the quiet that follows.
+        client.digital[101] = 1
+        await client._mark_synced()
+        assert client.presses == [const.LIGHTS_ENTRY_JOIN], "pressed the entry join twice"
+        assert client.synced is True
+
+    asyncio.run(scenario())
+
+
+def test_a_reconnect_enters_the_subsystem_again():
+    """Entry is per session, not once per process: a new session is a new slot."""
+    client = _client(const.LIGHTS_ENTRY_JOIN)
+
+    async def scenario():
+        await client._mark_synced()
+        await client._mark_synced()
+        assert client.synced is True
+
+        # What _session() does on the way back up after a drop.
+        client.synced = False
+        client._entered = False
+        client.digital.clear()
+
+        await client._mark_synced()
+        assert client.presses == [const.LIGHTS_ENTRY_JOIN] * 2
+
+    asyncio.run(scenario())
+
+
+def test_the_mc2e_link_has_no_subsystem_to_enter():
+    """The MC2E XPanel slot is ungated, which is why the Kitchen kept working."""
+    client = _client(None)
+
+    async def scenario():
+        await client._mark_synced()
+        assert client.presses == []
+        assert client.synced is True
+
+    asyncio.run(scenario())
+
+
+def test_only_the_aads_link_is_configured_to_enter_a_subsystem():
+    bridge = CrestronBridge({})
+    assert bridge._clients[const.LINK_AADS].entry_join == const.LIGHTS_ENTRY_JOIN
+    assert bridge._clients[const.LINK_MC2E].entry_join is None
+
+
+def test_the_entry_join_is_not_one_the_alarm_keypad_shares():
+    """d93 is the entry button for the Alarm subsystem; d91 is the one for Lights."""
+    assert const.LIGHTS_ENTRY_JOIN == 91
+    assert const.LIGHTS_ENTRY_JOIN not in const.FORBIDDEN_AADS_WRITE
+    assert 93 in const.FORBIDDEN_AADS_WRITE
