@@ -7,6 +7,7 @@ round-trips but no longer matches the wire will fail here.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib
 import pathlib
@@ -500,7 +501,7 @@ def test_island_presses_the_on_join_and_confirms_via_the_status_join():
 # ---- service registration -------------------------------------------------
 
 
-def test_services_are_not_registered_with_lambdas():
+def test_every_service_handler_is_a_coroutine_function():
     """Guard the trap that made the first live deploy a silent no-op.
 
     Home Assistant picks how to invoke a service handler with
@@ -509,15 +510,86 @@ def test_services_are_not_registered_with_lambdas():
     and reports success. The service call then returns HTTP 200 having done
     nothing; the only trace is a "coroutine was never awaited" RuntimeWarning.
 
-    __init__.py can't be imported here because it pulls in Home Assistant, so
-    this asserts on the source instead. Crude, but it catches the one shape
-    that regressed, and the runtime cost of missing it is a deploy cycle.
+    __init__.py cannot be imported here because it pulls in Home Assistant, so
+    this reads the source. It asks the structural question rather than grepping
+    for a spelling, though: every handler argument must resolve to an `async
+    def`, whether it is named directly or built by a factory. The previous
+    version asserted that a function literally called `_service` still existed,
+    which a rename broke and a reintroduced lambda in a new shape would not.
     """
-    source = (_PKG / "__init__.py").read_text()
-    for line in source.splitlines():
-        if "async_register" in line and "lambda" in line:
-            raise AssertionError(f"service registered with a lambda handler: {line.strip()}")
-    assert "def _service(" in source, "expected the async-def handler factory to still exist"
+    tree = ast.parse((_PKG / "__init__.py").read_text())
+    async_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)}
+
+    def own_returns(fn):
+        """The returns belonging to `fn` itself, not to functions nested in it."""
+        found, stack = [], list(fn.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                continue
+            if isinstance(node, ast.Return) and node.value:
+                found.append(node.value)
+            stack.extend(ast.iter_child_nodes(node))
+        return found
+
+    # A factory counts only if every return hands back an async def it defined.
+    factories = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        inner = {n.name for n in node.body if isinstance(n, ast.AsyncFunctionDef)}
+        returns = own_returns(node)
+        if returns and all(isinstance(r, ast.Name) and r.id in inner for r in returns):
+            factories.add(node.name)
+
+    registrations = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "async_register"
+    ]
+    assert registrations, "no service registrations found at all"
+
+    for call in registrations:
+        handler = call.args[2]
+        assert not isinstance(handler, ast.Lambda), "service registered with a lambda handler"
+        if isinstance(handler, ast.Call) and isinstance(handler.func, ast.Name):
+            assert handler.func.id in factories, (
+                f"{handler.func.id}() does not return an async def"
+            )
+        elif isinstance(handler, ast.Name):
+            assert handler.id in async_names, f"{handler.id} is not an async def"
+        else:
+            raise AssertionError(f"unrecognised handler expression: {ast.dump(handler)[:80]}")
+
+
+def test_every_documented_service_is_registered():
+    """services.yaml is the UI's only description of these, so it must not drift."""
+    documented = {
+        line.split(":")[0]
+        for line in (_PKG / "services.yaml").read_text().splitlines()
+        if line and not line[0].isspace() and ":" in line
+    }
+    tree = ast.parse((_PKG / "__init__.py").read_text())
+    registered = {
+        n.value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "async_register"
+        for n in [call.args[1]]
+        if isinstance(n, ast.Constant)
+    }
+    # Names built by the registration table are Name nodes, not constants, so
+    # pick those up from the table itself.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Tuple) and node.elts and isinstance(node.elts[0], ast.Constant):
+            if isinstance(node.elts[0].value, str) and node.elts[0].value in documented:
+                registered.add(node.elts[0].value)
+    assert documented == registered, (
+        f"services.yaml and __init__.py disagree: {documented ^ registered}"
+    )
 
 
 # ---- subsystem time-slicing -----------------------------------------------

@@ -102,7 +102,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.data[DOMAIN] = bridge
     await bridge.async_start()
 
-    def _service(method):
+    def _handler(method, *fields):
         """Wrap a bridge method as a service handler.
 
         This must return an `async def`, not a lambda that happens to return a
@@ -112,57 +112,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         floor. The service then reports success while doing nothing at all,
         which is exactly what happened on the first live deploy: the only trace
         was a "coroutine ... was never awaited" RuntimeWarning.
-        """
 
-        async def handle(call: ServiceCall) -> None:
-            try:
-                await method(call.data[ATTR_LOAD])
-            except CrestronError as err:
-                # Surface refusals and confirmation failures to whoever called
-                # the service instead of burying them in the log: a light that
-                # did not change is exactly what an automation needs to know.
-                raise HomeAssistantError(str(err)) from err
+        CrestronError becomes HomeAssistantError rather than being logged and
+        swallowed: a light that did not change is exactly what an automation
+        needs to know.
 
-        return handle
-
-    hass.services.async_register(DOMAIN, "turn_on", _service(bridge.async_turn_on), _SERVICE_SCHEMA)
-    hass.services.async_register(
-        DOMAIN, "turn_off", _service(bridge.async_turn_off), _SERVICE_SCHEMA
-    )
-    hass.services.async_register(DOMAIN, "toggle", _service(bridge.async_toggle), _SERVICE_SCHEMA)
-
-    async def handle_enter_subsystem(call: ServiceCall) -> dict[str, object]:
-        """Switch one slot between the Lights and A/V subsystems.
-
-        Returns where the slot ended up rather than only logging it, because the
-        interesting answer to "did the switch work" is the state afterwards, and
-        a service that reports success without saying that is the failure mode
-        this whole design is built around avoiding.
-        """
-        try:
-            return await bridge.async_enter_subsystem(
-                call.data[ATTR_LINK],
-                call.data[ATTR_SUBSYSTEM],
-                call.data[ATTR_HOLD_SECONDS],
-            )
-        except CrestronError as err:
-            raise HomeAssistantError(str(err)) from err
-
-    hass.services.async_register(
-        DOMAIN,
-        "enter_subsystem",
-        handle_enter_subsystem,
-        _ENTER_SCHEMA,
-        supports_response=SupportsResponse.OPTIONAL,
-    )
-
-    def _av(method, *fields):
-        """Wrap an A/V bridge method as a response-returning service handler.
-
-        Every one of these returns the zone's state afterwards rather than only
-        succeeding, because only the cursor's zone is readable at all and a
-        caller that just moved the cursor is the one caller guaranteed to be
-        able to see the result.
+        Every service returns the state it ended up in, because for the A/V ones
+        only the cursor's zone is readable at all and the caller that just moved
+        the cursor is the one caller guaranteed to be able to see the result.
+        The load services have nothing to add and return an empty mapping, which
+        is invisible to a caller that did not ask for a response.
         """
 
         async def handle(call: ServiceCall) -> dict[str, object]:
@@ -174,6 +133,15 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         return handle
 
     for name, method, schema, fields in (
+        ("turn_on", bridge.async_turn_on, _SERVICE_SCHEMA, (ATTR_LOAD,)),
+        ("turn_off", bridge.async_turn_off, _SERVICE_SCHEMA, (ATTR_LOAD,)),
+        ("toggle", bridge.async_toggle, _SERVICE_SCHEMA, (ATTR_LOAD,)),
+        (
+            "enter_subsystem",
+            bridge.async_enter_subsystem,
+            _ENTER_SCHEMA,
+            (ATTR_LINK, ATTR_SUBSYSTEM, ATTR_HOLD_SECONDS),
+        ),
         ("av_status", bridge.av.async_status, _ZONE_SCHEMA, (ATTR_ZONE,)),
         (
             "av_select_source",
@@ -189,7 +157,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         hass.services.async_register(
             DOMAIN,
             name,
-            _av(method, *fields),
+            _handler(method, *fields),
             schema,
             supports_response=SupportsResponse.OPTIONAL,
         )
