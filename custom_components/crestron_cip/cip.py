@@ -665,9 +665,17 @@ class CipClient:
     async def _press(self, join: int, hold: float = PRESS_HOLD_SECONDS) -> None:
         """Tap a digital join, checked against the joins that must never be written.
 
-        The alarm check is here as well as in the load table and the bridge
-        because this is the last point before bytes go on the wire and the only
-        one every write passes through, entry presses and A/V presses included.
+        This is one of two checks on the alarm range, and the only one that
+        covers every write: this is the last point before bytes go on the wire.
+        Entry presses and A/V presses do not come from the load table at all, so
+        const._validate(), the other check, never sees them.
+
+        There was a third, in the bridge, applying _validate()'s own predicate
+        to _validate()'s own data one call later. It could not fire: any table
+        that would have tripped it fails at import, so the module never loads.
+        Deleted rather than left to read like defence in depth, because the next
+        person auditing this needs to know that the check below is the one doing
+        the work. See the pdehlke/homeassistant repo, issue #26.
         """
         if join in self.forbidden:
             raise CrestronError(

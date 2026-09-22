@@ -35,7 +35,6 @@ from .const import (
     LINK_MC2E,
     LOADS,
     LOADS_BY_KEY,
-    Load,
 )
 from .link import Link
 
@@ -266,7 +265,6 @@ class CrestronBridge:
             raise CrestronError(f"unknown load {key!r}")
         if load.join is None:
             raise CrestronError(f"{key}: no join mapped yet, cannot control it")
-        self._guard(load)
 
         link = self._links[load.link]
         client = link.client
@@ -339,20 +337,6 @@ class CrestronBridge:
             f"{key}: pressed {CONFIRM_ATTEMPTS} times without the processor "
             f"confirming {'on' if want_on else 'off'}"
         )
-
-    def _guard(self, load: Load) -> None:
-        """Refuse to write a join the DSC alarm keypad shares.
-
-        const._validate() already rejects a table containing such a join at
-        import, and CipClient._press() checks again with the bytes in hand, which
-        is the check every write passes through including entry presses. This one
-        stays because it names the load, and because three checks on the one
-        thing in this system that must never be written is the right number.
-        Checked against every join the load could ever press (`press_joins`), not
-        just its canonical `join`, since press_on/press_off can differ from it.
-        """
-        if load.link == LINK_AADS and any(j in FORBIDDEN_AADS_WRITE for j in load.press_joins):
-            raise CrestronError(f"refusing to press {load.key}: shared with the DSC alarm keypad")
 
     # ---- confirmation waiters ---------------------------------------------
 
