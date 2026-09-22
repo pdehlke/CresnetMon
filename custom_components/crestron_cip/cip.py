@@ -689,7 +689,7 @@ class CipClient:
             await self._send(digital_packet(join, False))
             released = True
         finally:
-            if not released:
+            if not released and writer is not None:
                 # A press that is never released is a press-and-hold as far as
                 # the processor is concerned, and holding is not a no-op on this
                 # system: it ramps a dimmer, and on a learnable scene button it
@@ -705,9 +705,8 @@ class CipClient:
                 # Releasing a join that never actually went down is a no-op on
                 # the wire, so it is safe to do this even when the press itself
                 # is what failed.
-                if writer is not None:
-                    with contextlib.suppress(Exception):
-                        writer.write(digital_packet(join, False))
+                with contextlib.suppress(Exception):
+                    writer.write(digital_packet(join, False))
 
     async def async_press(
         self, join: int, subsystem: str | None, hold: float = PRESS_HOLD_SECONDS

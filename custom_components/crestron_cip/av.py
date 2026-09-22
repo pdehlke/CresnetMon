@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 
 from .cip import CipClient, CrestronError
 from .const import (
@@ -218,18 +219,34 @@ class AvController:
             )
         return zone
 
+    @asynccontextmanager
+    async def _slot(self, zone_key: str | None = None):
+        """Hold the slot, in A/V, with the cursor on `zone_key`, and hand it back.
+
+        Every operation below needs exactly this and none of it is optional, so
+        it stops being six things each method remembers to do and becomes one
+        thing it cannot skip. In particular the slot is always given back and
+        the link always marked busy, even when the body raises.
+
+        `zone_key=None` is the whole-system case, which takes the slot and
+        enters A/V but moves no cursor.
+        """
+        zone = self._zone(zone_key) if zone_key is not None else None
+        async with self._lock:
+            try:
+                await self._async_enter()
+                if zone is not None:
+                    await self._async_point_at(zone)
+                yield zone
+            finally:
+                self._touch()
+
     # ---- operations --------------------------------------------------------
 
     async def async_status(self, zone_key: str) -> dict[str, object]:
         """Read one zone. Costs a cursor move unless the cursor is already there."""
-        zone = self._zone(zone_key)
-        async with self._lock:
-            try:
-                await self._async_enter()
-                await self._async_point_at(zone)
-                return self._snapshot(zone)
-            finally:
-                self._touch()
+        async with self._slot(zone_key) as zone:
+            return self._snapshot(zone)
 
     async def async_select_source(self, zone_key: str, source: int) -> dict[str, object]:
         """Select a source, which also powers the zone on.
@@ -239,30 +256,24 @@ class AvController:
         AADS's per-source preset, not whatever it was before, so a caller that
         wants a level must set it after this and not before.
         """
-        zone = self._zone(zone_key)
         if source not in AV_SOURCES:
             raise CrestronError(f"source {source} is not one of {list(AV_SOURCES)}")
 
-        async with self._lock:
-            try:
-                await self._async_enter()
-                await self._async_point_at(zone)
-                if self._selected_source() == source:
-                    return self._snapshot(zone)
+        async with self._slot(zone_key) as zone:
+            if self._selected_source() == source:
+                return self._snapshot(zone)
 
-                press = source_press_join(source)
-                await self._client.async_press(press, SUBSYSTEM_AV)
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + CURSOR_CONFIRM_TIMEOUT
-                while loop.time() < deadline:
-                    if self._digital(press):
-                        return self._snapshot(zone)
-                    await asyncio.sleep(0.05)
-                raise CrestronError(
-                    f"{zone.key}: pressed d{press} for source {source} and it never came high"
-                )
-            finally:
-                self._touch()
+            press = source_press_join(source)
+            await self._client.async_press(press, SUBSYSTEM_AV)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + CURSOR_CONFIRM_TIMEOUT
+            while loop.time() < deadline:
+                if self._digital(press):
+                    return self._snapshot(zone)
+                await asyncio.sleep(0.05)
+            raise CrestronError(
+                f"{zone.key}: pressed d{press} for source {source} and it never came high"
+            )
 
     async def async_set_volume(self, zone_key: str, percent: float) -> dict[str, object]:
         """Ramp one zone to a target level and converge on it.
@@ -288,43 +299,38 @@ class AvController:
         target = percent_to_raw(percent)
 
         for segment in range(1, VOLUME_MAX_SEGMENTS + 1):
-            async with self._lock:
-                try:
-                    await self._async_enter()
-                    await self._async_point_at(zone)
-                    current = self._client.analog_for(SUBSYSTEM_AV).get(VOLUME_ANALOG)
-                    if current is None:
-                        raise CrestronError(
-                            f"{zone.key}: no volume reported on a{VOLUME_ANALOG}, refusing to "
-                            "ramp blind"
-                        )
+            async with self._slot(zone_key) as zone:
+                current = self._client.analog_for(SUBSYSTEM_AV).get(VOLUME_ANALOG)
+                if current is None:
+                    raise CrestronError(
+                        f"{zone.key}: no volume reported on a{VOLUME_ANALOG}, refusing to "
+                        "ramp blind"
+                    )
 
-                    delta = target - current
-                    if abs(delta) <= VOLUME_TOLERANCE:
-                        _LOGGER.debug(
-                            "%s: volume settled at %d, wanted %d, after %d segment(s)",
-                            zone.key,
-                            current,
-                            target,
-                            segment - 1,
-                        )
-                        return self._snapshot(zone)
-
-                    hold = min(MAX_HOLD_SECONDS, abs(delta) / VOLUME_RAMP_UNITS_PER_SECOND)
-                    join = VOLUME_UP_JOIN if delta > 0 else VOLUME_DOWN_JOIN
+                delta = target - current
+                if abs(delta) <= VOLUME_TOLERANCE:
                     _LOGGER.debug(
-                        "%s: at %d, want %d, holding d%d for %.2fs (segment %d)",
+                        "%s: volume settled at %d, wanted %d, after %d segment(s)",
                         zone.key,
                         current,
                         target,
-                        join,
-                        hold,
-                        segment,
+                        segment - 1,
                     )
-                    await self._client.async_press(join, SUBSYSTEM_AV, hold=hold)
-                    await asyncio.sleep(CURSOR_SETTLE_SECONDS)
-                finally:
-                    self._touch()
+                    return self._snapshot(zone)
+
+                hold = min(MAX_HOLD_SECONDS, abs(delta) / VOLUME_RAMP_UNITS_PER_SECOND)
+                join = VOLUME_UP_JOIN if delta > 0 else VOLUME_DOWN_JOIN
+                _LOGGER.debug(
+                    "%s: at %d, want %d, holding d%d for %.2fs (segment %d)",
+                    zone.key,
+                    current,
+                    target,
+                    join,
+                    hold,
+                    segment,
+                )
+                await self._client.async_press(join, SUBSYSTEM_AV, hold=hold)
+                await asyncio.sleep(CURSOR_SETTLE_SECONDS)
 
         final = self._client.analog_for(SUBSYSTEM_AV).get(VOLUME_ANALOG)
         raise CrestronError(
@@ -340,45 +346,31 @@ class AvController:
         "off but remembering its source", because restoring the source powers the
         zone on again.
         """
-        zone = self._zone(zone_key)
-        async with self._lock:
-            try:
-                await self._async_enter()
-                await self._async_point_at(zone)
-                if self._selected_source() is None and self._digital(ZONE_POWER_OFF_JOIN):
-                    return self._snapshot(zone)
-                await self._client.async_press(ZONE_POWER_OFF_JOIN, SUBSYSTEM_AV)
-                await asyncio.sleep(CURSOR_SETTLE_SECONDS)
+        async with self._slot(zone_key) as zone:
+            if self._selected_source() is None and self._digital(ZONE_POWER_OFF_JOIN):
                 return self._snapshot(zone)
-            finally:
-                self._touch()
+            await self._client.async_press(ZONE_POWER_OFF_JOIN, SUBSYSTEM_AV)
+            await asyncio.sleep(CURSOR_SETTLE_SECONDS)
+            return self._snapshot(zone)
 
     async def async_power_off_all(self) -> None:
         """Power every zone off at once, with one press rather than six visits."""
-        async with self._lock:
-            try:
-                await self._async_enter()
+        try:
+            async with self._slot():
                 await self._client.async_press(ALL_ZONES_OFF_JOIN, SUBSYSTEM_AV)
                 await asyncio.sleep(CURSOR_SETTLE_SECONDS)
-            finally:
-                # Every zone's state just changed, and only the cursor's is
-                # readable, so there is nothing honest to return here. Cleared
-                # in the finally because a press that reached the wire and then
-                # raised changed them just the same.
-                self._cursor = None
-                self._touch()
+        finally:
+            # Every zone's state just changed, and only the cursor's is
+            # readable, so there is nothing honest to return here. Cleared in
+            # the finally because a press that reached the wire and then raised
+            # changed them just the same.
+            self._cursor = None
 
     async def async_set_mute(self, zone_key: str, mute: bool) -> dict[str, object]:
         """Mute or unmute one zone. d48 is a toggle, so consult d46 first."""
-        zone = self._zone(zone_key)
-        async with self._lock:
-            try:
-                await self._async_enter()
-                await self._async_point_at(zone)
-                if bool(self._digital(MUTE_FEEDBACK_JOIN)) == mute:
-                    return self._snapshot(zone)
-                await self._client.async_press(MUTE_JOIN, SUBSYSTEM_AV)
-                await asyncio.sleep(CURSOR_SETTLE_SECONDS)
+        async with self._slot(zone_key) as zone:
+            if bool(self._digital(MUTE_FEEDBACK_JOIN)) == mute:
                 return self._snapshot(zone)
-            finally:
-                self._touch()
+            await self._client.async_press(MUTE_JOIN, SUBSYSTEM_AV)
+            await asyncio.sleep(CURSOR_SETTLE_SECONDS)
+            return self._snapshot(zone)
