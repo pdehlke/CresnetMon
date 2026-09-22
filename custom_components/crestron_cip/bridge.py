@@ -31,13 +31,13 @@ from .const import (
     CIP_PORT,
     DEFAULTS,
     FORBIDDEN_AADS_WRITE,
-    IDLE_RETURN_SECONDS,
     LINK_AADS,
     LINK_MC2E,
     LOADS,
     LOADS_BY_KEY,
     Load,
 )
+from .link import Link
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,53 +50,44 @@ class CrestronBridge:
     """Owns both CIP links and presents one load-keyed view of the house."""
 
     def __init__(self, config: dict[str, dict]) -> None:
-        self._clients: dict[str, CipClient] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._activity: dict[str, float] = {}
+        self._links: dict[str, Link] = {}
         self._listeners: list[Callable[[], None]] = []
         self._waiters: dict[str, list[tuple[bool, asyncio.Future[None]]]] = {}
         self._idle_task: asyncio.Task | None = None
 
-        # join -> load, per link. Aliases resolve to the same load, which is how
-        # one physical light on five buttons stays one entity.
-        self._by_join: dict[str, dict[int, Load]] = {LINK_AADS: {}, LINK_MC2E: {}}
+        for name in (LINK_AADS, LINK_MC2E):
+            settings = {**DEFAULTS[name], **config.get(name, {})}
+            self._links[name] = Link(
+                name,
+                CipClient(
+                    name=name,
+                    host=settings["host"],
+                    port=settings.get("port", CIP_PORT),
+                    ipid=settings["ipid"],
+                    subsystems=settings.get("subsystems"),
+                    default_subsystem=settings.get("default_subsystem"),
+                    forbidden=FORBIDDEN_AADS_WRITE if name == LINK_AADS else frozenset(),
+                    on_digital=(
+                        lambda join, value, subsystem, _link=name: self._on_digital(
+                            _link, join, value, subsystem
+                        )
+                    ),
+                    on_state=self._notify,
+                ),
+            )
         for load in LOADS:
             for join in load.joins:
-                self._by_join[load.link][join] = load
-
-        for link in (LINK_AADS, LINK_MC2E):
-            settings = {**DEFAULTS[link], **config.get(link, {})}
-            self._clients[link] = CipClient(
-                name=link,
-                host=settings["host"],
-                port=settings.get("port", CIP_PORT),
-                ipid=settings["ipid"],
-                subsystems=settings.get("subsystems"),
-                default_subsystem=settings.get("default_subsystem"),
-                forbidden=FORBIDDEN_AADS_WRITE if link == LINK_AADS else frozenset(),
-                on_digital=(
-                    lambda join, value, subsystem, _link=link: self._on_digital(
-                        _link, join, value, subsystem
-                    )
-                ),
-                on_state=self._notify,
-            )
-            self._locks[link] = asyncio.Lock()
-            self._activity[link] = 0.0
+                self._links[load.link].by_join[join] = load
 
         # Audio shares the AADS slot with lighting by taking turns, so it takes
-        # that link's lock rather than owning anything of its own.
-        self.av = AvController(
-            self._clients[LINK_AADS],
-            self._locks[LINK_AADS],
-            lambda: self._touch(LINK_AADS),
-        )
+        # that link rather than owning anything of its own.
+        self.av = AvController(self._links[LINK_AADS])
 
     # ---- lifecycle ---------------------------------------------------------
 
     async def async_start(self) -> None:
-        for client in self._clients.values():
-            await client.async_start()
+        for link in self._links.values():
+            await link.client.async_start()
         self._idle_task = asyncio.create_task(self._idle_watch(), name="crestron_cip-idle")
 
     async def async_stop(self) -> None:
@@ -109,8 +100,8 @@ class CrestronBridge:
             idle.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await idle
-        for client in self._clients.values():
-            await client.async_stop()
+        for link in self._links.values():
+            await link.client.async_stop()
 
     # ---- observation -------------------------------------------------------
 
@@ -128,13 +119,13 @@ class CrestronBridge:
             callback()
 
     def link_connected(self, link: str) -> bool:
-        client = self._clients.get(link)
-        return bool(client and client.connected and client.synced)
+        known = self._links.get(link)
+        return bool(known and known.connected)
 
     def subsystem(self, link: str) -> str | None:
         """Which subsystem the slot is in, or None for unknown or ungated."""
-        client = self._clients.get(link)
-        return client.current_subsystem if client else None
+        known = self._links.get(link)
+        return known.client.current_subsystem if known else None
 
     def is_available(self, key: str) -> bool:
         """A load is available once its link has a synced session and a join.
@@ -157,16 +148,17 @@ class CrestronBridge:
             return None
         # The dump reports only high joins, so a load the processor never
         # mentioned is off, not unknown. That is only true once synced.
-        return bool(self._clients[load.link].digital.get(load.join, 0))
+        return bool(self._links[load.link].client.digital.get(load.join, 0))
 
     def _on_digital(self, link: str, join: int, value: int, subsystem: str | None) -> None:
-        client = self._clients[link]
+        known = self._links[link]
+        client = known.client
         if subsystem != client.default_subsystem:
             # The A/V pages reuse d101-d109, d201-d204 and d151-d157 for things
             # that are not lights at all, so a join arriving from another
             # subsystem says nothing about a load and must not move one.
             return
-        load = self._by_join[link].get(join)
+        load = known.by_join.get(join)
         if load is None:
             return
         # An alias moving is the same event as the canonical join moving. Mirror
@@ -178,10 +170,6 @@ class CrestronBridge:
 
     # ---- the shared slot ---------------------------------------------------
 
-    def _touch(self, link: str, hold_seconds: float = 0.0) -> None:
-        """Mark the link busy, optionally pushing the idle deadline out."""
-        self._activity[link] = asyncio.get_running_loop().time() + hold_seconds
-
     async def async_enter_subsystem(
         self, link: str, subsystem: str, hold_seconds: float = 0.0
     ) -> dict[str, object]:
@@ -192,18 +180,19 @@ class CrestronBridge:
         call anyway. `hold_seconds` defers the idle return, which is what makes
         the excursion long enough to look at by hand.
         """
-        client = self._clients.get(link)
-        if client is None:
+        known = self._links.get(link)
+        if known is None:
             raise CrestronError(f"unknown link {link!r}")
+        client = known.client
         if subsystem not in client.subsystems:
-            known = ", ".join(sorted(client.subsystems)) or "none"
-            raise CrestronError(f"{link} has no {subsystem!r} subsystem (knows: {known})")
-        if not self.link_connected(link):
+            names = ", ".join(sorted(client.subsystems)) or "none"
+            raise CrestronError(f"{link} has no {subsystem!r} subsystem (knows: {names})")
+        if not known.connected:
             raise CrestronError(f"{link} link is not connected")
 
-        async with self._locks[link]:
+        async with known.lock:
             entered = await client.async_enter(subsystem)
-            self._touch(link, hold_seconds)
+            known.touch(hold_seconds)
         if not entered:
             raise CrestronError(f"{link}: the {subsystem} subsystem did not answer the entry press")
         return {"link": link, "subsystem": client.current_subsystem}
@@ -223,39 +212,35 @@ class CrestronBridge:
         while True:
             try:
                 await asyncio.sleep(IDLE_WATCH_INTERVAL)
-                now = asyncio.get_running_loop().time()
-                for link, client in self._clients.items():
+                for link in self._links.values():
+                    client = link.client
                     default = client.default_subsystem
                     if default is None or not client.subsystems:
                         continue
-                    if not self.link_connected(link):
+                    if not link.connected or link.lock.locked() or not link.idle:
                         continue
                     # None means unknown, and recovering from that belongs to the
                     # next write or the bring-up, which both rebuild state anyway.
                     if client.current_subsystem in (None, default):
                         continue
-                    if self._locks[link].locked():
-                        continue
-                    if now - self._activity[link] < IDLE_RETURN_SECONDS:
-                        continue
-                    async with self._locks[link]:
+                    async with link.lock:
                         # Rechecked in full. The pre-checks above are what make
                         # this acquire uncontended and therefore non-yielding,
                         # so nothing can change underneath today; a recheck that
                         # covered only the subsystem would quietly stop being
                         # enough the moment that skip became a wait.
-                        if not self.link_connected(link):
+                        if not link.connected:
                             continue
                         if client.current_subsystem in (None, default):
                             continue
                         _LOGGER.info(
                             "%s: idle in %s, returning to %s",
-                            link,
+                            link.name,
                             client.current_subsystem,
                             default,
                         )
                         await client.async_enter(default)
-                        self._touch(link)
+                        link.touch()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -283,12 +268,13 @@ class CrestronBridge:
             raise CrestronError(f"{key}: no join mapped yet, cannot control it")
         self._guard(load)
 
-        client = self._clients[load.link]
-        if not (client.connected and client.synced):
+        link = self._links[load.link]
+        client = link.client
+        if not link.connected:
             raise CrestronError(f"{key}: {load.link} link is not connected")
         subsystem = client.default_subsystem
 
-        async with self._locks[load.link]:
+        async with link.lock:
             try:
                 for attempt in range(1, CONFIRM_ATTEMPTS + 1):
                     # Revalidated every attempt, not just before the lock. The
@@ -299,10 +285,8 @@ class CrestronBridge:
                     # client serialises the collection buffer itself now, so
                     # this is about failing the command honestly rather than
                     # about the buffer.
-                    if not (client.connected and client.synced):
-                        raise CrestronError(
-                            f"{key}: the {load.link} link dropped mid-command"
-                        )
+                    if not link.connected:
+                        raise CrestronError(f"{key}: the {load.link} link dropped mid-command")
                     # First thing every attempt, because the state this reads
                     # next is only trustworthy once the subsystem's own dump has
                     # landed, and because a retry after an unconfirmed press gets
@@ -349,7 +333,7 @@ class CrestronBridge:
                     finally:
                         self._drop_waiter(key, waiter)
             finally:
-                self._touch(load.link)
+                link.touch()
 
         raise CrestronError(
             f"{key}: pressed {CONFIRM_ATTEMPTS} times without the processor "

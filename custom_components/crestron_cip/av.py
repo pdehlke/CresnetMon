@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
 from contextlib import asynccontextmanager
 
-from .cip import CipClient, CrestronError
+from .cip import CrestronError
 from .const import (
     ALL_ZONES_OFF_JOIN,
     AV_NO_SOURCE_JOIN,
@@ -53,6 +52,7 @@ from .const import (
     source_name_serial,
     source_press_join,
 )
+from .link import Link
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,10 +75,14 @@ class AvController:
     latency.
     """
 
-    def __init__(self, client: CipClient, lock: asyncio.Lock, touch: Callable[[], None]) -> None:
-        self._client = client
-        self._lock = lock
-        self._touch = touch
+    def __init__(self, link: Link) -> None:
+        # Takes the link, not three pieces of one. The three used to be passed
+        # separately, which meant the bridge handing over a
+        # `lambda: self._touch(LINK_AADS)` closure to say something the link
+        # object now says by being itself: audio shares this slot.
+        self._client = link.client
+        self._lock = link.lock
+        self._touch = link.touch
         self._cursor: str | None = None
         self._cursor_generation = -1
 

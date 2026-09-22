@@ -27,6 +27,8 @@ sys.modules.setdefault("crestron_cip", _parent)
 
 const = importlib.import_module("crestron_cip.const")
 _bridge_mod = importlib.import_module("crestron_cip.bridge")
+_link_mod = importlib.import_module("crestron_cip.link")
+Link = _link_mod.Link
 _cip_mod = importlib.import_module("crestron_cip.cip")
 
 CONFIRM_ATTEMPTS = _bridge_mod.CONFIRM_ATTEMPTS
@@ -272,7 +274,9 @@ def test_a_poisoned_load_table_fails_at_import_not_at_press_time():
     sys.modules["crestron_cip._poisoned_const"] = module
     try:
         with pytest.raises(ValueError, match="alarm"):
-            exec(compile(poisoned, "const.py", "exec"), module.__dict__)
+            # A controlled string built from this repo's own source, which is
+            # the only way to observe const.py's import-time validation.
+            exec(compile(poisoned, "const.py", "exec"), module.__dict__)  # noqa: S102
     finally:
         del sys.modules["crestron_cip._poisoned_const"]
 
@@ -340,13 +344,18 @@ def make_bridge():
             default_subsystem=settings["default_subsystem"],
         )
         fake._bridge, fake._link = bridge, link
-        bridge._clients[link] = fake
+        bridge._links[link].client = fake
     return bridge
+
+
+def client_of(bridge, link=const.LINK_AADS):
+    """The stand-in client behind one link, which is what most tests assert on."""
+    return bridge._links[link].client
 
 
 def test_turn_on_presses_once_and_turn_on_again_presses_not_at_all():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     asyncio.run(bridge.async_turn_on("office_pool_bath"))
     assert aads.presses == [245]
@@ -361,7 +370,7 @@ def test_turn_on_presses_once_and_turn_on_again_presses_not_at_all():
 
 def test_turn_off_on_an_already_off_load_does_nothing():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     asyncio.run(bridge.async_turn_off("office_pool_bath"))
     assert aads.presses == []
 
@@ -373,14 +382,14 @@ def test_feedback_on_an_alias_moves_the_load():
     bridge._on_digital(const.LINK_AADS, 247, 1, const.SUBSYSTEM_LIGHTS)
     assert bridge.is_on("outdoor_kitchen") is True
 
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     asyncio.run(bridge.async_turn_on("outdoor_kitchen"))
     assert aads.presses == []
 
 
 def test_press_targets_the_canonical_join_never_the_forbidden_alias():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     asyncio.run(bridge.async_turn_on("outdoor_kitchen"))
     assert aads.presses == [104]
     assert 144 not in aads.presses
@@ -393,7 +402,7 @@ def test_powder_presses_a_different_join_for_on_than_off():
     # the only usable on-join. Off was never broken and stays on d102, same as
     # before press_on existed.
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     asyncio.run(bridge.async_turn_on("dining_room_powder"))
     assert aads.presses == [127]
@@ -423,7 +432,7 @@ def test_a_load_with_no_join_mapped_refuses_rather_than_guess():
 
 def test_a_load_on_a_disconnected_link_refuses():
     bridge = make_bridge()
-    bridge._clients[const.LINK_AADS].synced = False
+    client_of(bridge, const.LINK_AADS).synced = False
     assert bridge.is_on("office_pool_bath") is None
     with pytest.raises(CrestronError, match="not connected"):
         asyncio.run(bridge.async_turn_on("office_pool_bath"))
@@ -431,7 +440,7 @@ def test_a_load_on_a_disconnected_link_refuses():
 
 def test_a_press_the_processor_never_confirms_retries_then_fails():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     aads.reply = False  # silent processor
     with pytest.raises(CrestronError, match="without the processor confirming"):
         asyncio.run(bridge.async_turn_on("office_pool_bath"))
@@ -440,7 +449,7 @@ def test_a_press_the_processor_never_confirms_retries_then_fails():
 
 def test_concurrent_turn_on_presses_once():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     async def race():
         await asyncio.gather(
@@ -457,7 +466,7 @@ def test_concurrent_turn_on_presses_once():
 
 def test_toggle_refuses_when_state_is_unknown():
     bridge = make_bridge()
-    bridge._clients[const.LINK_AADS].synced = False
+    client_of(bridge, const.LINK_AADS).synced = False
     with pytest.raises(CrestronError, match="refusing to toggle blind"):
         asyncio.run(bridge.async_toggle("office_pool_bath"))
 
@@ -482,7 +491,7 @@ def test_island_presses_the_on_join_and_confirms_via_the_status_join():
     bridge = make_bridge()
     mc2e = FakeIslandClient(subsystems={}, default_subsystem=None)
     mc2e._bridge, mc2e._link = bridge, const.LINK_MC2E
-    bridge._clients[const.LINK_MC2E] = mc2e
+    bridge._links[const.LINK_MC2E].client = mc2e
 
     asyncio.run(bridge.async_turn_on("kitchen_island"))
     assert mc2e.presses == [27]
@@ -561,7 +570,11 @@ def test_every_service_handler_is_a_coroutine_function():
         elif isinstance(handler, ast.Name):
             assert handler.id in async_names, f"{handler.id} is not an async def"
         else:
-            raise AssertionError(f"unrecognised handler expression: {ast.dump(handler)[:80]}")
+            # AssertionError, not TypeError: this is a test reporting that the
+            # source grew a handler shape it does not know how to vet.
+            raise AssertionError(  # noqa: TRY004
+                f"unrecognised handler expression: {ast.dump(handler)[:80]}"
+            )
 
 
 def test_every_documented_service_is_registered():
@@ -584,9 +597,11 @@ def test_every_documented_service_is_registered():
     # Names built by the registration table are Name nodes, not constants, so
     # pick those up from the table itself.
     for node in ast.walk(tree):
-        if isinstance(node, ast.Tuple) and node.elts and isinstance(node.elts[0], ast.Constant):
-            if isinstance(node.elts[0].value, str) and node.elts[0].value in documented:
-                registered.add(node.elts[0].value)
+        if not (isinstance(node, ast.Tuple) and node.elts):
+            continue
+        first = node.elts[0]
+        if isinstance(first, ast.Constant) and first.value in documented:
+            registered.add(first.value)
     assert documented == registered, (
         f"services.yaml and __init__.py disagree: {documented ^ registered}"
     )
@@ -994,7 +1009,7 @@ def test_a_re_poll_that_times_out_still_merges_what_arrived():
 
 def test_a_lighting_write_while_the_slot_is_in_av_enters_lights_first():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     aads.current_subsystem = const.SUBSYSTEM_AV
 
     asyncio.run(bridge.async_turn_on("office_pool_bath"))
@@ -1005,7 +1020,7 @@ def test_a_lighting_write_while_the_slot_is_in_av_enters_lights_first():
 
 def test_a_lighting_write_already_in_lights_presses_no_entry_join():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     asyncio.run(bridge.async_turn_on("office_pool_bath"))
     assert aads.entries == []
@@ -1014,7 +1029,7 @@ def test_a_lighting_write_already_in_lights_presses_no_entry_join():
 
 def test_the_mc2e_link_is_never_asked_to_enter_anything():
     bridge = make_bridge()
-    mc2e = bridge._clients[const.LINK_MC2E]
+    mc2e = client_of(bridge, const.LINK_MC2E)
 
     asyncio.run(bridge.async_turn_on("kitchen_cabinet"))
     assert mc2e.entries == []
@@ -1024,7 +1039,7 @@ def test_the_mc2e_link_is_never_asked_to_enter_anything():
 def test_a_failed_entry_refuses_rather_than_pressing_the_load_join():
     """Pressing into a slot that is not in the subsystem is the failure to avoid."""
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     aads.current_subsystem = const.SUBSYSTEM_AV
     aads.entry_replies = False
 
@@ -1042,7 +1057,7 @@ def test_an_unconfirmed_press_forgets_the_subsystem_so_the_retry_re_enters():
     press makes the next attempt re-press the entry join and rebuild state.
     """
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     aads.reply = False
 
     with pytest.raises(CrestronError, match="without the processor confirming"):
@@ -1055,7 +1070,7 @@ def test_an_unconfirmed_press_forgets_the_subsystem_so_the_retry_re_enters():
 
 def test_two_operations_wanting_different_subsystems_serialize():
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     async def race():
         await asyncio.gather(
@@ -1087,9 +1102,9 @@ def test_enter_subsystem_refuses_a_link_that_has_none():
 def test_an_idle_slot_returns_to_the_default_subsystem(monkeypatch):
     """Otherwise nothing ever switches back and lighting feedback stays frozen."""
     monkeypatch.setattr(_bridge_mod, "IDLE_WATCH_INTERVAL", 0.01)
-    monkeypatch.setattr(_bridge_mod, "IDLE_RETURN_SECONDS", 0.0)
+    monkeypatch.setattr(_link_mod, "IDLE_RETURN_SECONDS", 0.0)
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
     aads.current_subsystem = const.SUBSYSTEM_AV
 
     async def scenario():
@@ -1107,9 +1122,9 @@ def test_an_idle_slot_returns_to_the_default_subsystem(monkeypatch):
 
 def test_a_slot_that_is_not_idle_is_left_alone(monkeypatch):
     monkeypatch.setattr(_bridge_mod, "IDLE_WATCH_INTERVAL", 0.01)
-    monkeypatch.setattr(_bridge_mod, "IDLE_RETURN_SECONDS", 30.0)
+    monkeypatch.setattr(_link_mod, "IDLE_RETURN_SECONDS", 30.0)
     bridge = make_bridge()
-    aads = bridge._clients[const.LINK_AADS]
+    aads = client_of(bridge, const.LINK_AADS)
 
     async def scenario():
         await bridge.async_enter_subsystem(const.LINK_AADS, const.SUBSYSTEM_AV)
@@ -1163,8 +1178,8 @@ def test_the_bridge_holds_the_kitchen_slot_not_the_office_one():
 
 def test_only_the_aads_link_is_configured_with_subsystems():
     bridge = CrestronBridge({})
-    aads = bridge._clients[const.LINK_AADS]
-    mc2e = bridge._clients[const.LINK_MC2E]
+    aads = client_of(bridge, const.LINK_AADS)
+    mc2e = client_of(bridge, const.LINK_MC2E)
     assert aads.subsystems == const.ENTRY_JOINS
     assert aads.default_subsystem == const.SUBSYSTEM_LIGHTS
     assert aads.forbidden == const.FORBIDDEN_AADS_WRITE
@@ -1464,8 +1479,8 @@ ZONE_KEYS = [zone.key for zone in const.ZONES]
 
 def make_av():
     client = FakeAvClient()
-    lock = asyncio.Lock()
-    return client, AvController(client, lock, lambda: None), lock
+    link = Link(const.LINK_AADS, client)
+    return client, AvController(link), link.lock
 
 
 def test_the_zone_table_matches_the_mapped_joins():
@@ -1802,7 +1817,7 @@ def test_an_unconfirmed_cursor_move_is_not_cached_as_confirmed():
     One room gets blasted and the requested room never moves.
     """
     client = UnconfirmedCursorClient()
-    av = AvController(client, asyncio.Lock(), lambda: None)
+    av = AvController(Link(const.LINK_AADS, client))
     select = const.ZONES_BY_KEY["kitchen"].select_join
 
     async def scenario():
