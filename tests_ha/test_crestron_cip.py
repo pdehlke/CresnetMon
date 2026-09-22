@@ -253,6 +253,29 @@ def test_validate_rejects_a_forbidden_press_on_even_when_join_is_clean():
         const.LOADS = original
 
 
+def test_a_poisoned_load_table_fails_at_import_not_at_press_time():
+    """The two tests above call _validate() by hand; this proves it runs itself.
+
+    Deleting the bare `_validate()` call at the bottom of const.py leaves every
+    other test in this file green, which would move the whole check from
+    "import fails loudly" to "nothing happens until someone turns that light
+    on". Executing a poisoned copy of the real source is the only way to assert
+    the automatic firing rather than the function.
+    """
+    poisoned = (_PKG / "const.py").read_text().replace(
+        "_MC2E_LOADS: tuple[Load, ...] = (",
+        '_MC2E_LOADS: tuple[Load, ...] = (\n    Load("poison", "Poison", LINK_AADS, 146),',
+        1,
+    )
+    module = types.ModuleType("crestron_cip._poisoned_const")
+    sys.modules["crestron_cip._poisoned_const"] = module
+    try:
+        with pytest.raises(ValueError, match="alarm"):
+            exec(compile(poisoned, "const.py", "exec"), module.__dict__)
+    finally:
+        del sys.modules["crestron_cip._poisoned_const"]
+
+
 # ---- bridge behaviour -----------------------------------------------------
 
 
@@ -292,6 +315,9 @@ class FakeClient:
 
     def invalidate_subsystem(self):
         self.current_subsystem = None
+
+    async def async_stop(self):
+        self.connected = self.synced = False
 
     async def async_press(self, join, subsystem, hold=0.0):
         assert subsystem == self.current_subsystem, (
@@ -834,6 +860,63 @@ def test_every_press_passes_the_forbidden_check():
     assert "digital_packet" not in public, "async_press builds its own frames, bypassing the check"
 
 
+def test_two_entries_at_once_do_not_share_one_collection_buffer():
+    """There is one _collecting buffer and two callers that can reach it.
+
+    _bring_up() enters without holding the bridge lock, and _async_set() checks
+    `synced` before taking that lock but never again inside it, so a session
+    that drops and reconnects during the 3s confirmation wait puts a bring-up
+    entry and a retry entry on the same buffer. Whichever poll loop lands first
+    takes whatever is in it, which is how an A/V join gets published as a
+    lighting one: exactly the cross-subsystem confusion the bucketing exists to
+    prevent.
+    """
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1, 105: 1}
+    client.dumps[const.AV_ENTRY_JOIN] = {51: 1}
+
+    async def scenario():
+        first = asyncio.create_task(client.async_enter(const.SUBSYSTEM_LIGHTS))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(client.async_enter(const.SUBSYSTEM_AV))
+        return await asyncio.gather(first, second)
+
+    assert asyncio.run(scenario()) == [True, True], "one entry was starved by the other"
+    assert (51, 1, const.SUBSYSTEM_AV) in client.seen
+    assert (101, 1, const.SUBSYSTEM_LIGHTS) in client.seen
+    assert (51, 1, const.SUBSYSTEM_LIGHTS) not in client.seen, (
+        "an A/V join was published as a lighting join"
+    )
+
+
+def test_a_re_poll_that_times_out_still_merges_what_arrived():
+    """The update request diverts live feedback; a timeout must not bin it.
+
+    _handle_data() routes every digital frame into the collection buffer while a
+    re-poll is open, so returning early on timeout throws away up to
+    REPOLL_TIMEOUT seconds of real feedback. A wall-panel press inside that
+    window is lost outright. The entry has already succeeded by the time
+    _bring_up() re-polls, so the frames unambiguously belong to `subsystem`:
+    unlike a failed entry, there is nothing ambiguous to protect against.
+    """
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+
+    async def _send(packet):
+        if packet == _cip_mod.UPDATE_REQUEST and client._collecting is not None:
+            # A frame lands, but the end-of-query marker never follows.
+            client._collecting.update({241: 1})
+
+    async def scenario():
+        assert await client.async_enter(const.SUBSYSTEM_LIGHTS) is True
+        client._send = _send
+        assert await client.async_repoll(const.SUBSYSTEM_LIGHTS) is False
+        assert client.digital.get(241) == 1, "the re-poll discarded what it collected"
+        assert (241, 1, const.SUBSYSTEM_LIGHTS) in client.seen
+
+    asyncio.run(scenario())
+
+
 # ---- the shared slot, from the bridge's side ------------------------------
 
 
@@ -967,6 +1050,28 @@ def test_a_slot_that_is_not_idle_is_left_alone(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_stopping_the_bridge_waits_for_the_idle_watch_to_unwind():
+    """Otherwise the idle task unwinds concurrently with the socket teardown.
+
+    async_stop() goes on to await each client's async_stop(), which yields, so a
+    cancelled-but-unawaited idle task gets its CancelledError while _close() is
+    nulling the writer out from under whatever press it was in the middle of.
+    CipClient.async_stop() already awaits its own task; this is the one that
+    does not.
+    """
+    async def scenario():
+        bridge = make_bridge()
+        bridge._idle_task = asyncio.create_task(bridge._idle_watch())
+        await asyncio.sleep(0)
+        task = bridge._idle_task
+        await bridge.async_stop()
+        # Asserted here, not after asyncio.run() returns: the loop cancels and
+        # collects stragglers on the way out, which would hide the bug.
+        assert task.done(), "async_stop returned while the idle watch was still unwinding"
+
+    asyncio.run(scenario())
+
+
 # ---- configuration --------------------------------------------------------
 
 
@@ -1090,6 +1195,56 @@ def test_a_press_cancelled_mid_hold_still_releases_the_join():
             digital_packet(const.LIGHTS_ENTRY_JOIN, True),
             digital_packet(const.LIGHTS_ENTRY_JOIN, False),
         ], "the join was left held down"
+
+    asyncio.run(scenario())
+
+
+def test_a_press_cancelled_by_a_close_still_releases_the_join():
+    """The sibling test above covers a bare cancel. This covers the real caller.
+
+    _close() nulls self._writer *before* it cancels the bring-up task, so by the
+    time the cancelled _press() reaches its finally there is no writer left to
+    send the release through. That is precisely the scenario the fallback's own
+    comment names as its reason for existing.
+    """
+    written = []
+
+    class FakeWriter:
+        def write(self, packet):
+            written.append(packet)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    client = _cip_mod.CipClient(
+        name="test",
+        host="127.0.0.1",
+        port=const.CIP_PORT,
+        ipid=0x13,
+        on_digital=lambda join, value, subsystem: None,
+        subsystems=const.ENTRY_JOINS,
+        default_subsystem=const.SUBSYSTEM_LIGHTS,
+        forbidden=const.FORBIDDEN_AADS_WRITE,
+    )
+    client.connected = True
+    client._writer = FakeWriter()
+
+    async def scenario():
+        press = asyncio.create_task(client._press(const.LIGHTS_ENTRY_JOIN, hold=5.0))
+        # This is what a bring-up mid-entry looks like to _close().
+        client._bringup = press
+        await asyncio.sleep(0.05)
+        await client._close()
+        assert written == [
+            digital_packet(const.LIGHTS_ENTRY_JOIN, True),
+            digital_packet(const.LIGHTS_ENTRY_JOIN, False),
+        ], "closing the session left the entry join held down"
 
     asyncio.run(scenario())
 
@@ -1550,3 +1705,41 @@ def test_av_operations_refuse_a_disconnected_link():
     client.synced = False
     with pytest.raises(CrestronError, match="not connected"):
         asyncio.run(av.async_status("studio"))
+
+
+class UnconfirmedCursorClient(FakeAvClient):
+    """A processor whose s11 never agrees, the case _async_point_at warns about.
+
+    Serials are not reliably refreshed on a subsystem switch (s16 was seen still
+    reading 'Lights' after the slot had returned to A/V), so proceeding on the
+    press alone is right. Believing it afterwards is not.
+    """
+
+    def _publish(self):
+        super()._publish()
+        self.serial[const.ZONE_NAME_SERIAL] = "Somewhere Else"
+
+
+def test_an_unconfirmed_cursor_move_is_not_cached_as_confirmed():
+    """Caching a guess turns one bad read into a whole session of bad writes.
+
+    Every later operation takes the shortcut at the top of _async_point_at and
+    does no press, no s11 check and no analog wait, so a ramp spends every one
+    of its twelve segments holding d44 against whatever zone the cursor really
+    sits on, while a11 reports that same wrong zone so the delta never shrinks.
+    One room gets blasted and the requested room never moves.
+    """
+    client = UnconfirmedCursorClient()
+    av = AvController(client, asyncio.Lock(), lambda: None)
+    select = const.ZONES_BY_KEY["kitchen"].select_join
+
+    async def scenario():
+        await av.async_status("kitchen")
+        first = [join for join, _ in client.presses].count(select)
+        await av.async_status("kitchen")
+        second = [join for join, _ in client.presses].count(select)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first >= 1
+    assert second > first, "an unconfirmed cursor was cached and never re-pressed"
