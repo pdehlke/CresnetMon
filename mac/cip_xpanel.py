@@ -14,6 +14,35 @@ import time
 
 HOST, PORT, IPID = "192.168.4.59", 41794, 0x03
 
+# The DSC alarm keypad shares this join range on the AADS: d130-d148 are the
+# keypad digits, Arm ToHome, and Fire/Medical/Panic, and d93 enters the alarm
+# subsystem from the home page. Mirrors FORBIDDEN_AADS_WRITE in the shipped
+# integration, custom_components/crestron_cip/const.py.
+AADS_HOST = "192.168.4.61"
+FORBIDDEN_AADS_WRITE = frozenset(range(130, 149)) | {93}
+
+
+def refuse_forbidden(joins, host: str) -> None:
+    """Exit rather than press a join the DSC alarm keypad shares on the AADS.
+
+    Keyed on the host, not applied everywhere, because the MC2E's XPanel
+    program has no alarm joins at all: poc_joinscan.py's default sweep covers
+    d93, and on the MC2E that is an ordinary join. So this is a no-op for the
+    scripts pinned to the MC2E today, and becomes real the moment one of them
+    grows a --host flag or someone reassigns crestron_console.HOST, which its
+    own comment invites.
+
+    Lives here, on the module every join-pressing script already imports,
+    rather than being copied per caller. poc_panelpress.py and
+    poc_subsystem_timing.py each carry their own copy, which is exactly how
+    poc_joinpress.py and poc_joinscan.py came to have none.
+    """
+    if host != AADS_HOST:
+        return
+    bad = sorted(set(joins) & FORBIDDEN_AADS_WRITE)
+    if bad:
+        sys.exit(f"refusing to press {bad} on the AADS: shared with the DSC alarm keypad")
+
 HEARTBEAT = b"\x0d\x00\x02\x00\x00"
 UPDATE_REQUEST = b"\x05\x00\x05\x00\x00\x02\x03\x00"
 END_OF_QUERY_ACK = b"\x05\x00\x05\x00\x00\x02\x03\x1d"

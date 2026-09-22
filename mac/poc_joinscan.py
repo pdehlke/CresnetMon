@@ -35,7 +35,7 @@ import sys
 import time
 
 import crestron_console as ccon
-from cip_xpanel import PORT, Listener
+from cip_xpanel import PORT, Listener, refuse_forbidden
 from poc_joinpress import MODULES, SETUP, TEARDOWN, digital, pump
 
 FRAME = re.compile(r"CTX:Slot-01\.ID-(7[0-9A-F])\s*:\s*(\[[0-9A-F\]\[]+\])")
@@ -70,6 +70,7 @@ def main() -> int:
 
     skip = {int(s) for s in args.skip.split(",") if s.strip()}
     joins = [j for j in range(args.lo, args.hi + 1) if j not in skip]
+    refuse_forbidden(joins, ccon.HOST)
     per = args.watch + args.settle
     print(f"scanning joins {args.lo}-{args.hi} ({len(joins)} joins, "
           f"skipping {sorted(skip) or 'none'})")

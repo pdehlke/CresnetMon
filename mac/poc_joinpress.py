@@ -36,7 +36,7 @@ import sys
 import time
 
 import crestron_console as ccon
-from cip_xpanel import HEARTBEAT, PORT, Listener
+from cip_xpanel import HEARTBEAT, PORT, Listener, refuse_forbidden
 from poc_witness import ROLLCALL_FLOOR, Console, Tap, autodetect_port, gate
 
 from cresnetmon.serial_io import PortOpenError, open_port
@@ -120,6 +120,7 @@ def main() -> int:
     args = ap.parse_args()
 
     joins = [int(j) for j in args.join.split(",")]
+    refuse_forbidden(joins, ccon.HOST)
     downs = [digital(j, True) for j in joins]
     ups = [digital(j, False) for j in joins]
     for j, d, u in zip(joins, downs, ups, strict=True):

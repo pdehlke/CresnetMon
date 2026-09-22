@@ -18,10 +18,20 @@ from poc_joinpress import HOLD_SECONDS, digital, pump
 # that range, which is why it is refused too: use MC2E IP-ID 0x03 for Kitchen.
 FORBIDDEN = set(range(130, 149)) | {93}
 
+# 0x12 is the slot the live lighting bridge holds, as of 2026-09-22 when it moved
+# there from 0x13. Pressing into it fights Home Assistant for the slot's one
+# subsystem latch. Same guard poc_subsystem_timing.py carries.
+BRIDGE_IPID = 0x12
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--join", type=int, required=True)
 ap.add_argument("--host", default="192.168.4.61")
 ap.add_argument("--ipid", type=lambda s: int(s, 0), default=0x13)
+ap.add_argument(
+    "--allow-bridge-slot",
+    action="store_true",
+    help=f"permit IP-ID 0x{BRIDGE_IPID:02X}, which Home Assistant's lighting bridge holds",
+)
 ap.add_argument("--presses", type=int, default=1)
 ap.add_argument("--watch", type=float, default=12.0)
 ap.add_argument("--prefix", type=int, default=0, help="press this join first, e.g. 91 for Lights")
@@ -30,6 +40,13 @@ a = ap.parse_args()
 for j in (a.join, a.prefix):
     if j in FORBIDDEN:
         sys.exit(f"refusing join {j}: shared with the DSC alarm keypad")
+
+if a.ipid == BRIDGE_IPID and not a.allow_bridge_slot:
+    sys.exit(
+        f"IP-ID 0x{BRIDGE_IPID:02X} is the slot Home Assistant's lighting bridge holds.\n"
+        "Pressing there fights it for the slot's one subsystem latch and can take every\n"
+        "AADS load offline. Use a free slot, or pass --allow-bridge-slot if you mean it."
+    )
 
 listener = Listener(a.ipid, False)
 sock = socket.create_connection((a.host, PORT), timeout=5)
