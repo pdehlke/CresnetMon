@@ -20,19 +20,22 @@ import logging
 
 import voluptuous as vol
 from homeassistant.const import CONF_HOST, Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.typing import ConfigType
 
 from .bridge import CrestronBridge, CrestronError
-from .const import DOMAIN, LINK_AADS, LINK_MC2E, LOADS_BY_KEY
+from .const import DOMAIN, ENTRY_JOINS, LINK_AADS, LINK_MC2E, LOADS_BY_KEY
 
 _LOGGER = logging.getLogger(__name__)
 
 CONF_IPID = "ipid"
 ATTR_LOAD = "load"
+ATTR_LINK = "link"
+ATTR_SUBSYSTEM = "subsystem"
+ATTR_HOLD_SECONDS = "hold_seconds"
 
 _LINK_SCHEMA = vol.Schema(
     {
@@ -54,6 +57,16 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 _SERVICE_SCHEMA = vol.Schema({vol.Required(ATTR_LOAD): vol.In(sorted(LOADS_BY_KEY))})
+
+_ENTER_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_LINK, default=LINK_AADS): vol.In([LINK_AADS, LINK_MC2E]),
+        vol.Required(ATTR_SUBSYSTEM): vol.In(sorted(ENTRY_JOINS)),
+        vol.Optional(ATTR_HOLD_SECONDS, default=0.0): vol.All(
+            vol.Coerce(float), vol.Range(min=0, max=300)
+        ),
+    }
+)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -91,6 +104,31 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         DOMAIN, "turn_off", _service(bridge.async_turn_off), _SERVICE_SCHEMA
     )
     hass.services.async_register(DOMAIN, "toggle", _service(bridge.async_toggle), _SERVICE_SCHEMA)
+
+    async def handle_enter_subsystem(call: ServiceCall) -> dict[str, object]:
+        """Switch one slot between the Lights and A/V subsystems.
+
+        Returns where the slot ended up rather than only logging it, because the
+        interesting answer to "did the switch work" is the state afterwards, and
+        a service that reports success without saying that is the failure mode
+        this whole design is built around avoiding.
+        """
+        try:
+            return await bridge.async_enter_subsystem(
+                call.data[ATTR_LINK],
+                call.data[ATTR_SUBSYSTEM],
+                call.data[ATTR_HOLD_SECONDS],
+            )
+        except CrestronError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    hass.services.async_register(
+        DOMAIN,
+        "enter_subsystem",
+        handle_enter_subsystem,
+        _ENTER_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
     hass.async_create_task(async_load_platform(hass, Platform.BINARY_SENSOR, DOMAIN, {}, config))
 

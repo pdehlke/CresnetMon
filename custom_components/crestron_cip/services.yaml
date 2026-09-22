@@ -41,3 +41,48 @@ toggle:
       example: office_pool_bath
       selector:
         text:
+
+enter_subsystem:
+  name: Enter a Crestron subsystem
+  description: >-
+    Switch one panel slot between the Lights and A/V subsystems. The AADS reuses
+    join numbers across subsystems, so a slot holds exactly one at a time and the
+    bridge refuses to write a lighting join while the slot is in A/V. Returns the
+    subsystem the slot ended up in. Switching away freezes lighting feedback until
+    the slot returns, which it does on its own once idle.
+  fields:
+    link:
+      name: Link
+      description: Which processor link to switch. Only the AADS has subsystems.
+      required: false
+      default: aads
+      example: aads
+      selector:
+        select:
+          options:
+            - aads
+            - mc2e
+    subsystem:
+      name: Subsystem
+      description: Which subsystem to enter.
+      required: true
+      example: av
+      selector:
+        select:
+          options:
+            - lights
+            - av
+    hold_seconds:
+      name: Hold
+      description: >-
+        Defer the automatic return to Lights by this many seconds, so the
+        excursion lasts long enough to observe. Leave at zero in normal use.
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: s
+  response:
+    optional: true

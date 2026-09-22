@@ -38,9 +38,99 @@ LINK_MC2E = "mc2e"
 # it is in FORBIDDEN_AADS_WRITE below for exactly that reason.
 LIGHTS_ENTRY_JOIN = 91
 
+# d75 is the same kind of button for the A/V subsystem, confirmed live on
+# 2026-09-17 by two full round trips on slot 0x14. One slot can carry both
+# lighting and audio by taking turns, which is why the bridge does not need a
+# second sacrificed touch panel; what it cannot do is hold both at once, because
+# the A/V pages reuse d101-d109, d201-d204 and d151-d157 for entirely different
+# things. See docs/crestron/crestron-subsystem-time-slicing.md in the
+# pdehlke/homeassistant repo.
+AV_ENTRY_JOIN = 75
+
+SUBSYSTEM_LIGHTS = "lights"
+SUBSYSTEM_AV = "av"
+
+ENTRY_JOINS = {SUBSYSTEM_LIGHTS: LIGHTS_ENTRY_JOIN, SUBSYSTEM_AV: AV_ENTRY_JOIN}
+
+# How long the link has to stay quiet before an entry dump counts as complete.
+#
+# Measured 2026-09-22 by mac/poc_subsystem_timing.py, over five live entries on
+# slot 0x14 and two more on 0x12. No entry produces the end-of-query marker the
+# registration dump ends with, so quiet is the only available signal. The binding
+# constraint is the largest gap between two consecutive frames inside one dump:
+#
+#   Lights   0.144s, 0.155s, 0.166s on 0x14; 0.246s on 0x12
+#   A/V      0.352s, 0.349s on 0x14;         0.419s on 0x12
+#
+# Each threshold is twice the worst gap seen for that subsystem across both
+# slots. The A/V dump's larger gap reproduced on the second slot, so it is a
+# property of the processor rather than of one panel.
+#
+# Below the measured gap, an entry would be declared complete in the middle of
+# its own dump and the subsystem would be rebuilt from partial state, which
+# reads exactly like a quiet house: confident, complete-looking and wrong.
+ENTRY_QUIET_SECONDS = {SUBSYSTEM_LIGHTS: 0.50, SUBSYSTEM_AV: 0.85}
+
+# An entry dump arrives in bursts, and the gap between two bursts can exceed the
+# quiet threshold above. On 2026-09-22 a Lights entry on the bridge's own slot
+# went quiet for longer than the threshold after its first frame and the
+# collection window closed 0.47s in, on a dump whose last frame lands at about
+# 0.53s. So the window
+# has a floor as well as a quiet test: it cannot close before the dump has had
+# time to finish, whatever the silence in the middle of it looks like.
+ENTRY_MIN_SECONDS = 0.9
+
+# Entry dumps land in 0.514s to 0.529s and the slowest dump ever measured on
+# this processor is the 0.964s registration dump, so this is generous.
+ENTRY_TIMEOUT = 3.0
+
+# Re-sending the registration-time update request mid-session returns the full
+# state rather than the partial one an entry dump gives, and ends with the
+# explicit end-of-query marker, so it is waited on exactly rather than by quiet.
+# Measured 2026-09-22 at about 0.86s for 149 frames, three times running.
+REPOLL_TIMEOUT = 5.0
+
+# A failed entry produces no traffic, which leaves the link quiet enough to
+# qualify for another bring-up immediately. Rate-limit the retry rather than
+# spin on a processor that is not answering.
+BRINGUP_RETRY_SECONDS = 5.0
+
+# How long the slot may sit in a non-default subsystem with nothing to do before
+# it is returned to the default one. While the slot is away, lighting state is
+# frozen at whatever the last Lights dump said and a light changed at a wall
+# panel is invisible, which is tolerable for a second and wrong for an hour.
+# Longer than any one operation is allowed to hold the slot lock, or a running
+# A/V walk would pay a pointless round trip between every zone.
+IDLE_RETURN_SECONDS = 5.0
+
+# The AADS runs a courtesy action when a panel slot enters the Lights subsystem:
+# it turns on a light in that panel's own room. Slot 0x14, the Guest Suite panel,
+# turns on East Hall, which pde had observed for years whenever that panel woke
+# from standby. Slot 0x13 was the Office panel, and it turns on North Sink.
+#
+# That made the bridge switch a light on every reconnect, every Home Assistant
+# restart and every return from A/V, because all three enter Lights. Measured
+# and reproduced three times on 2026-09-22, at 1.1s after the entry press.
+#
+# So the bridge moved to slot 0x12, the Kitchen panel, which was taken offline
+# for the purpose. Entering Lights there turns nothing on, tested both by hand at
+# the panel and over CIP before the move. The fix is the slot, not code: nothing
+# here can stop the AADS program running its own entry logic. Full write-up in
+# the pdehlke/homeassistant repo at
+# docs/crestron/crestron-subsystem-time-slicing.md.
 DEFAULTS = {
-    LINK_AADS: {"host": "192.168.4.61", "ipid": 0x13, "entry_join": LIGHTS_ENTRY_JOIN},
-    LINK_MC2E: {"host": "192.168.4.59", "ipid": 0x03, "entry_join": None},
+    LINK_AADS: {
+        "host": "192.168.4.61",
+        "ipid": 0x12,
+        "subsystems": ENTRY_JOINS,
+        "default_subsystem": SUBSYSTEM_LIGHTS,
+    },
+    LINK_MC2E: {
+        "host": "192.168.4.59",
+        "ipid": 0x03,
+        "subsystems": {},
+        "default_subsystem": None,
+    },
 }
 
 # The DSC alarm keypad page (5-SEC / ALARM-DSC-pg01-main) reuses this join range
@@ -269,8 +359,18 @@ def _validate() -> None:
     distinct press_on/press_off, like Island, could otherwise smuggle a
     forbidden press in through one of those without this catching it.
     """
-    if LIGHTS_ENTRY_JOIN in FORBIDDEN_AADS_WRITE:
-        raise ValueError("the lighting subsystem-entry join is one the DSC alarm keypad shares")
+    for subsystem, join in ENTRY_JOINS.items():
+        if join in FORBIDDEN_AADS_WRITE:
+            raise ValueError(f"the {subsystem} subsystem-entry join is one the DSC alarm shares")
+    if SUBSYSTEM_LIGHTS not in ENTRY_JOINS or ENTRY_JOINS[SUBSYSTEM_LIGHTS] != LIGHTS_ENTRY_JOIN:
+        raise ValueError("the lights subsystem must enter on LIGHTS_ENTRY_JOIN")
+    for link, settings in DEFAULTS.items():
+        default = settings["default_subsystem"]
+        if default is not None and default not in settings["subsystems"]:
+            raise ValueError(f"{link}'s default subsystem {default!r} has no entry join")
+    missing = set(ENTRY_QUIET_SECONDS) ^ set(ENTRY_JOINS)
+    if missing:
+        raise ValueError(f"no measured entry quiet threshold for {sorted(missing)}")
 
     seen: dict[tuple[str, int], str] = {}
     for load in LOADS:

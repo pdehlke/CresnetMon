@@ -257,27 +257,61 @@ def test_validate_rejects_a_forbidden_press_on_even_when_join_is_clean():
 
 
 class FakeClient:
-    """Stands in for a registered CIP session, recording what got pressed."""
+    """Stands in for a registered CIP session, recording what got pressed.
 
-    def __init__(self, *, connected=True, synced=True):
+    Models the subsystem latch as well as the presses, because half of what the
+    bridge does now is decide which subsystem to be in before it presses
+    anything. `async_press` asserts it was called in the subsystem the slot is
+    actually in, so a bridge that forgot to switch fails here rather than
+    quietly pressing the AppleTV menu.
+    """
+
+    def __init__(self, *, connected=True, synced=True, subsystems=None, default_subsystem=None):
         self.connected = connected
         self.synced = synced
+        self.subsystems = dict(subsystems) if subsystems else {}
+        self.default_subsystem = default_subsystem
+        self.current_subsystem = default_subsystem if self.subsystems else None
         self.digital: dict[int, int] = {}
         self.presses: list[int] = []
+        self.entries: list[str] = []
         self.reply: bool = True
+        self.entry_replies: bool = True
 
-    async def async_press(self, join, hold=0.0):
+    async def async_enter(self, subsystem):
+        if subsystem is None or not self.subsystems:
+            return True
+        if self.current_subsystem == subsystem:
+            return True
+        self.entries.append(subsystem)
+        if not self.entry_replies:
+            self.current_subsystem = None
+            return False
+        self.current_subsystem = subsystem
+        return True
+
+    def invalidate_subsystem(self):
+        self.current_subsystem = None
+
+    async def async_press(self, join, subsystem, hold=0.0):
+        assert subsystem == self.current_subsystem, (
+            f"pressed d{join} for {subsystem} while the slot was in {self.current_subsystem}"
+        )
         self.presses.append(join)
         if self.reply:
             # Real hardware answers with feedback; the bridge is waiting on it.
             self.digital[join] = 0 if self.digital.get(join) else 1
-            self._bridge._on_digital(self._link, join, self.digital[join])
+            self._bridge._on_digital(self._link, join, self.digital[join], subsystem)
 
 
 def make_bridge():
     bridge = CrestronBridge({})
     for link in (const.LINK_AADS, const.LINK_MC2E):
-        fake = FakeClient()
+        settings = const.DEFAULTS[link]
+        fake = FakeClient(
+            subsystems=settings["subsystems"],
+            default_subsystem=settings["default_subsystem"],
+        )
         fake._bridge, fake._link = bridge, link
         bridge._clients[link] = fake
     return bridge
@@ -309,7 +343,7 @@ def test_feedback_on_an_alias_moves_the_load():
     bridge = make_bridge()
     # Outdoor Kitchen is one load on five buttons. d247 moving is the same event
     # as d104 moving, and must not produce a second, disagreeing load.
-    bridge._on_digital(const.LINK_AADS, 247, 1)
+    bridge._on_digital(const.LINK_AADS, 247, 1, const.SUBSYSTEM_LIGHTS)
     assert bridge.is_on("outdoor_kitchen") is True
 
     aads = bridge._clients[const.LINK_AADS]
@@ -409,17 +443,17 @@ class FakeIslandClient(FakeClient):
     hardware: pressing 27 brought the load on and 29 (not 27) went high.
     """
 
-    async def async_press(self, join, hold=0.0):
+    async def async_press(self, join, subsystem, hold=0.0):
         self.presses.append(join)
         if self.reply:
             value = 1 if join == 27 else 0
             self.digital[29] = value
-            self._bridge._on_digital(self._link, 29, value)
+            self._bridge._on_digital(self._link, 29, value, subsystem)
 
 
 def test_island_presses_the_on_join_and_confirms_via_the_status_join():
     bridge = make_bridge()
-    mc2e = FakeIslandClient()
+    mc2e = FakeIslandClient(subsystems={}, default_subsystem=None)
     mc2e._bridge, mc2e._link = bridge, const.LINK_MC2E
     bridge._clients[const.LINK_MC2E] = mc2e
 
@@ -460,93 +494,601 @@ def test_services_are_not_registered_with_lambdas():
     assert "def _service(" in source, "expected the async-def handler factory to still exist"
 
 
-# ---- lighting subsystem gating --------------------------------------------
+# ---- subsystem time-slicing -----------------------------------------------
+#
+# A slot on the AADS holds exactly one subsystem at a time and the join space is
+# reused across them, so `d101` is Dining Room Table in Lights and the AppleTV
+# menu in A/V. Everything below is about the bridge never confusing the two, in
+# either direction: it must not write a lighting join from A/V, and it must not
+# let an A/V join move a light. Measurements and design in the
+# pdehlke/homeassistant repo, docs/crestron/crestron-subsystem-time-slicing.md.
 
 
-def _client(entry_join):
+@pytest.fixture(autouse=True)
+def _fast_entries(monkeypatch):
+    """Keep the real thresholds out of the test clock without hiding them.
+
+    The measured values are asserted by their own test below; these only make
+    the waiting cheap, since an entry is detected by a quiet window and the real
+    one is a third of a second.
+    """
+    monkeypatch.setattr(_cip_mod, "ENTRY_QUIET_SECONDS", dict.fromkeys(const.ENTRY_JOINS, 0.02))
+    monkeypatch.setattr(_cip_mod, "ENTRY_MIN_SECONDS", 0.01)
+    monkeypatch.setattr(_cip_mod, "ENTRY_TIMEOUT", 0.2)
+    monkeypatch.setattr(_cip_mod, "REPOLL_TIMEOUT", 0.2)
+
+
+def _client(subsystems=None, default_subsystem=const.SUBSYSTEM_LIGHTS):
+    """A real CipClient with the socket removed and dumps that can be scripted.
+
+    `_send` is stubbed rather than `_press`, so the alarm-range check inside
+    `_press` stays in the path of every test here. `dumps` maps an entry join to
+    the joins that entry reports back; an entry join with no dump models a
+    processor that ignores the press, which is the 2026-09-15 failure.
+    """
     client = _cip_mod.CipClient(
         name="test",
         host="127.0.0.1",
         port=const.CIP_PORT,
         ipid=0x13,
-        on_digital=lambda join, value: None,
-        entry_join=entry_join,
+        on_digital=lambda join, value, subsystem: client.seen.append((join, value, subsystem)),
+        subsystems=const.ENTRY_JOINS if subsystems is None else subsystems,
+        default_subsystem=default_subsystem,
+        forbidden=const.FORBIDDEN_AADS_WRITE,
     )
     client.connected = True
+    client.seen = []
     client.presses = []
+    client.dumps = {}
+    # What the mid-session update request returns, which on real hardware is the
+    # full state rather than the entry dump's partial one. None models a
+    # processor that does not answer it.
+    client.repoll_dump = {}
+
+    async def _send(packet):
+        if packet != _cip_mod.UPDATE_REQUEST or client.repoll_dump is None:
+            return
+        if client._collecting is not None:
+            client._collecting.update(client.repoll_dump)
+        client._end_of_query.set()
+
+    real_press = client._press
 
     async def _press(join, hold=0.0):
+        await real_press(join, hold=0.0)
         client.presses.append(join)
+        dump = client.dumps.get(join)
+        if dump is not None and client._collecting is not None:
+            client._collecting.update(dump)
+            client._last_data_rx = asyncio.get_running_loop().time()
 
-    client.async_press = _press
+    client._send = _send
+    client._press = _press
     return client
 
 
-def test_the_aads_link_enters_the_lighting_subsystem_before_it_calls_itself_synced():
-    """The failure this guards against is silent and looks exactly like a dark house.
-
-    A slot the AADS has registered but not admitted to the Lights subsystem
-    reports no lighting joins at all, so syncing on that dump would have every
-    load read off and every press ignored. That is what a power cut produced on
-    2026-09-15. The entry press has to come first, and `synced` has to wait for
-    what it brings back.
-    """
-    client = _client(const.LIGHTS_ENTRY_JOIN)
+def test_entering_a_subsystem_applies_its_dump():
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1, 105: 1}
 
     async def scenario():
-        await client._mark_synced()
+        assert await client.async_enter(const.SUBSYSTEM_LIGHTS) is True
         assert client.presses == [const.LIGHTS_ENTRY_JOIN]
-        assert client.synced is False, "synced before the subsystem's own dump landed"
-
-        # The joins the entry press shook loose, then the quiet that follows.
-        client.digital[101] = 1
-        await client._mark_synced()
-        assert client.presses == [const.LIGHTS_ENTRY_JOIN], "pressed the entry join twice"
-        assert client.synced is True
+        assert client.current_subsystem == const.SUBSYSTEM_LIGHTS
+        assert client.digital == {101: 1, 105: 1}
+        assert sorted(client.seen) == [
+            (101, 1, const.SUBSYSTEM_LIGHTS),
+            (105, 1, const.SUBSYSTEM_LIGHTS),
+        ]
 
     asyncio.run(scenario())
 
 
-def test_a_reconnect_enters_the_subsystem_again():
-    """Entry is per session, not once per process: a new session is a new slot."""
-    client = _client(const.LIGHTS_ENTRY_JOIN)
+def test_a_join_missing_from_the_entry_dump_is_left_alone_not_reported_off():
+    """The live regression of 2026-09-22, and the reason entry merges.
+
+    An earlier version treated a join absent from the entry dump as off, on the
+    theory that the dump re-asserts every high join. Deployed, that reported
+    North Sink off while the light was physically on: d241 was not in that
+    entry's dump and never followed. A dump says nothing about what it omits.
+
+    The accepted cost is the other side of the same coin. A load switched off at
+    a wall panel while the slot was away in A/V keeps reading on until a later
+    frame corrects it. Stale beats wrong, especially when the wrong direction is
+    a lit load reading off, which is the signature of the 2026-09-15 outage.
+    """
+    client = _client()
+    client.dumps = {
+        const.LIGHTS_ENTRY_JOIN: {101: 1, 243: 1},
+        const.AV_ENTRY_JOIN: {1251: 1},
+    }
 
     async def scenario():
-        await client._mark_synced()
-        await client._mark_synced()
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        assert client.digital == {101: 1, 243: 1}
+
+        await client.async_enter(const.SUBSYSTEM_AV)
+        client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+        client.seen.clear()
+
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        assert client.digital == {101: 1, 243: 1}, "a partial dump reported a lit load off"
+        assert client.seen == []
+
+    asyncio.run(scenario())
+
+
+def test_the_collection_window_cannot_close_before_the_dump_has_had_time(monkeypatch):
+    """The second live fault of 2026-09-22, which made entities move twice.
+
+    An entry dump arrives in bursts and the gap between them can exceed the
+    quiet threshold. One Lights entry closed its window 0.47s in, on a dump
+    whose last frame lands at about 0.53s; everything after that arrived outside
+    the collection and moved entities a second time. The floor is what keeps the
+    window open across an intra-dump gap.
+    """
+    monkeypatch.setattr(_cip_mod, "ENTRY_MIN_SECONDS", 0.30)
+    monkeypatch.setattr(_cip_mod, "ENTRY_TIMEOUT", 2.0)
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {243: 1}
+    collecting_when_late_burst_landed = []
+
+    async def late_burst():
+        await asyncio.sleep(0.15)
+        collecting_when_late_burst_landed.append(client._collecting is not None)
+        if client._collecting is not None:
+            client._collecting[241] = 1
+            client._last_data_rx = asyncio.get_running_loop().time()
+
+    async def scenario():
+        task = asyncio.create_task(late_burst())
+        assert await client.async_enter(const.SUBSYSTEM_LIGHTS) is True
+        await task
+        assert collecting_when_late_burst_landed == [True], "window closed mid-dump"
+        assert client.digital == {243: 1, 241: 1}
+
+    asyncio.run(scenario())
+
+
+def test_a_dump_that_re_asserts_the_same_values_reports_nothing():
+    client = _client()
+    client.dumps = {
+        const.LIGHTS_ENTRY_JOIN: {101: 1, 105: 1},
+        const.AV_ENTRY_JOIN: {1251: 1},
+    }
+
+    async def scenario():
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        await client.async_enter(const.SUBSYSTEM_AV)
+        client.seen.clear()
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        assert client.seen == []
+        assert client.digital == {101: 1, 105: 1}
+
+    asyncio.run(scenario())
+
+
+def test_an_av_join_never_lands_in_the_lighting_bucket():
+    """d101 is Dining Room Table in Lights and the AppleTV menu in A/V."""
+    client = _client()
+    client.dumps = {
+        const.LIGHTS_ENTRY_JOIN: {105: 1},
+        const.AV_ENTRY_JOIN: {101: 1},
+    }
+
+    async def scenario():
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        await client.async_enter(const.SUBSYSTEM_AV)
+        assert client.digital == {105: 1}, "an A/V join reached the lighting bucket"
+        assert client.digital_for(const.SUBSYSTEM_AV) == {101: 1}
+        assert (101, 1, const.SUBSYSTEM_AV) in client.seen
+
+    asyncio.run(scenario())
+
+
+def test_an_entry_that_gets_no_answer_fails_rather_than_pretending():
+    """An entry that reported nothing is indistinguishable from a dark house."""
+    client = _client()
+
+    async def scenario():
+        assert await client.async_enter(const.SUBSYSTEM_LIGHTS) is False
+        assert client.presses == [const.LIGHTS_ENTRY_JOIN]
+        assert client.current_subsystem is None
+
+    asyncio.run(scenario())
+
+
+def test_bring_up_syncs_only_behind_the_subsystem_dump():
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+
+    async def scenario():
+        await client._bring_up()
         assert client.synced is True
+        assert client.current_subsystem == const.SUBSYSTEM_LIGHTS
+        assert client.digital == {101: 1}
 
-        # What _session() does on the way back up after a drop.
-        client.synced = False
-        client._entered = False
-        client.digital.clear()
+    asyncio.run(scenario())
 
-        await client._mark_synced()
-        assert client.presses == [const.LIGHTS_ENTRY_JOIN] * 2
+
+def test_bring_up_leaves_the_link_unsynced_when_the_subsystem_does_not_open():
+    """Syncing on the menu dump alone is what made every load read off."""
+    client = _client()
+
+    async def scenario():
+        await client._bring_up()
+        assert client.synced is False
+        assert client.current_subsystem is None
+
+    asyncio.run(scenario())
+
+
+def test_bring_up_re_polls_because_the_entry_dump_under_reports():
+    """The wrong reading pde caught on 2026-09-22, and why bring-up re-polls.
+
+    An entry dump is partial: one Lights entry omitted d241 while the light was
+    physically on. At bring-up the bucket starts empty, so absence really does
+    mean off there and a partial dump makes a lit load read off for the life of
+    the session. The update request returns the full state and ends with an
+    explicit end-of-query marker, so bring-up asks for it.
+    """
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+    client.repoll_dump = {101: 1, 241: 1}
+
+    async def scenario():
+        await client._bring_up()
+        assert client.synced is True
+        assert client.digital == {101: 1, 241: 1}, "the re-poll's fuller state was not merged"
+
+    asyncio.run(scenario())
+
+
+def test_bring_up_still_syncs_when_the_re_poll_goes_unanswered():
+    """The entry dump is incomplete, not wrong, so it is better than nothing."""
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+    client.repoll_dump = None
+
+    async def scenario():
+        await client._bring_up()
+        assert client.synced is True
+        assert client.digital == {101: 1}
+
+    asyncio.run(scenario())
+
+
+def test_an_ungated_link_does_not_re_poll():
+    """The re-poll is the cure for a partial entry dump, and there is no entry here.
+
+    An ungated link's registration dump is already the full one. The MC2E also
+    answers no second update request: before this, every startup spent the whole
+    REPOLL_TIMEOUT waiting for an end-of-query that never came, then carried on
+    with what it already had.
+    """
+    client = _client(subsystems={}, default_subsystem=None)
+    client.repoll_dump = {21: 1}
+
+    async def scenario():
+        await client._bring_up()
+        assert client.synced is True
+        assert client.presses == []
+        assert client.digital == {}, "an ungated link re-polled anyway"
 
     asyncio.run(scenario())
 
 
 def test_the_mc2e_link_has_no_subsystem_to_enter():
     """The MC2E XPanel slot is ungated, which is why the Kitchen kept working."""
-    client = _client(None)
+    client = _client(subsystems={}, default_subsystem=None)
 
     async def scenario():
-        await client._mark_synced()
-        assert client.presses == []
+        assert await client.async_enter(None) is True
+        await client._bring_up()
         assert client.synced is True
+        assert client.presses == []
 
     asyncio.run(scenario())
 
 
-def test_only_the_aads_link_is_configured_to_enter_a_subsystem():
+def test_pressing_a_join_for_the_wrong_subsystem_is_refused():
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+
+    async def scenario():
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        with pytest.raises(_cip_mod.CrestronError, match="refusing to press"):
+            await client.async_press(101, const.SUBSYSTEM_AV)
+
+    asyncio.run(scenario())
+
+
+def test_the_alarm_range_is_refused_at_the_wire_in_either_subsystem():
+    client = _client()
+    client.dumps[const.LIGHTS_ENTRY_JOIN] = {101: 1}
+
+    async def scenario():
+        await client.async_enter(const.SUBSYSTEM_LIGHTS)
+        for join in (146, 147, 148, 93):
+            with pytest.raises(_cip_mod.CrestronError, match="DSC alarm"):
+                await client.async_press(join, const.SUBSYSTEM_LIGHTS)
+            with pytest.raises(_cip_mod.CrestronError, match="DSC alarm"):
+                await client._press(join)
+
+    asyncio.run(scenario())
+
+
+def test_every_press_passes_the_forbidden_check():
+    """Structural, not a sample: the check is on the only path to the wire.
+
+    Three write surfaces now reach this client, load presses, entry presses and
+    whatever step 2 adds for A/V, so the guarantee has to be that there is one
+    door rather than that each caller remembers to knock.
+    """
+    source = (_PKG / "cip.py").read_text()
+    press = source[source.index("async def _press(") : source.index("async def async_press(")]
+    assert "self.forbidden" in press, "the raw press stopped checking the alarm range"
+
+    public = source[source.index("async def async_press(") :]
+    assert "await self._press(" in public, "async_press stopped going through the checked press"
+    assert "digital_packet" not in public, "async_press builds its own frames, bypassing the check"
+
+
+# ---- the shared slot, from the bridge's side ------------------------------
+
+
+def test_a_lighting_write_while_the_slot_is_in_av_enters_lights_first():
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+    aads.current_subsystem = const.SUBSYSTEM_AV
+
+    asyncio.run(bridge.async_turn_on("office_pool_bath"))
+    assert aads.entries == [const.SUBSYSTEM_LIGHTS]
+    assert aads.presses == [245]
+    assert bridge.is_on("office_pool_bath") is True
+
+
+def test_a_lighting_write_already_in_lights_presses_no_entry_join():
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+
+    asyncio.run(bridge.async_turn_on("office_pool_bath"))
+    assert aads.entries == []
+    assert aads.presses == [245]
+
+
+def test_the_mc2e_link_is_never_asked_to_enter_anything():
+    bridge = make_bridge()
+    mc2e = bridge._clients[const.LINK_MC2E]
+
+    asyncio.run(bridge.async_turn_on("kitchen_cabinet"))
+    assert mc2e.entries == []
+    assert mc2e.presses == [21]
+
+
+def test_a_failed_entry_refuses_rather_than_pressing_the_load_join():
+    """Pressing into a slot that is not in the subsystem is the failure to avoid."""
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+    aads.current_subsystem = const.SUBSYSTEM_AV
+    aads.entry_replies = False
+
+    with pytest.raises(CrestronError, match="could not enter"):
+        asyncio.run(bridge.async_turn_on("office_pool_bath"))
+    assert aads.presses == []
+
+
+def test_an_unconfirmed_press_forgets_the_subsystem_so_the_retry_re_enters():
+    """Issue #25, which this model answers with one assignment.
+
+    If the AADS ever drops a slot out of Lights without the session dropping,
+    the old bridge had no way back: every command failed forever until something
+    unrelated forced a reconnect. Forgetting the subsystem on an unconfirmed
+    press makes the next attempt re-press the entry join and rebuild state.
+    """
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+    aads.reply = False
+
+    with pytest.raises(CrestronError, match="without the processor confirming"):
+        asyncio.run(bridge.async_turn_on("office_pool_bath"))
+
+    assert len(aads.presses) == CONFIRM_ATTEMPTS
+    # The first attempt was already in Lights, so only the retries re-enter.
+    assert aads.entries == [const.SUBSYSTEM_LIGHTS] * (CONFIRM_ATTEMPTS - 1)
+
+
+def test_two_operations_wanting_different_subsystems_serialize():
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+
+    async def race():
+        await asyncio.gather(
+            bridge.async_enter_subsystem(const.LINK_AADS, const.SUBSYSTEM_AV),
+            bridge.async_turn_on("office_pool_bath"),
+        )
+
+    asyncio.run(race())
+    # FakeClient.async_press asserts it was called in the subsystem the slot is
+    # actually in, so the press landing at all is the real assertion here.
+    assert aads.entries == [const.SUBSYSTEM_AV, const.SUBSYSTEM_LIGHTS]
+    assert aads.presses == [245]
+
+
+def test_enter_subsystem_reports_where_the_slot_ended_up():
+    bridge = make_bridge()
+
+    result = asyncio.run(bridge.async_enter_subsystem(const.LINK_AADS, const.SUBSYSTEM_AV))
+    assert result == {"link": const.LINK_AADS, "subsystem": const.SUBSYSTEM_AV}
+    assert bridge.subsystem(const.LINK_AADS) == const.SUBSYSTEM_AV
+
+
+def test_enter_subsystem_refuses_a_link_that_has_none():
+    bridge = make_bridge()
+    with pytest.raises(CrestronError, match="no 'av' subsystem"):
+        asyncio.run(bridge.async_enter_subsystem(const.LINK_MC2E, const.SUBSYSTEM_AV))
+
+
+def test_an_idle_slot_returns_to_the_default_subsystem(monkeypatch):
+    """Otherwise nothing ever switches back and lighting feedback stays frozen."""
+    monkeypatch.setattr(_bridge_mod, "IDLE_WATCH_INTERVAL", 0.01)
+    monkeypatch.setattr(_bridge_mod, "IDLE_RETURN_SECONDS", 0.0)
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+    aads.current_subsystem = const.SUBSYSTEM_AV
+
+    async def scenario():
+        task = asyncio.create_task(bridge._idle_watch())
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if aads.current_subsystem == const.SUBSYSTEM_LIGHTS:
+                break
+        task.cancel()
+        assert aads.current_subsystem == const.SUBSYSTEM_LIGHTS
+        assert aads.entries == [const.SUBSYSTEM_LIGHTS]
+
+    asyncio.run(scenario())
+
+
+def test_a_slot_that_is_not_idle_is_left_alone(monkeypatch):
+    monkeypatch.setattr(_bridge_mod, "IDLE_WATCH_INTERVAL", 0.01)
+    monkeypatch.setattr(_bridge_mod, "IDLE_RETURN_SECONDS", 30.0)
+    bridge = make_bridge()
+    aads = bridge._clients[const.LINK_AADS]
+
+    async def scenario():
+        await bridge.async_enter_subsystem(const.LINK_AADS, const.SUBSYSTEM_AV)
+        task = asyncio.create_task(bridge._idle_watch())
+        await asyncio.sleep(0.1)
+        task.cancel()
+        assert aads.current_subsystem == const.SUBSYSTEM_AV
+        assert aads.entries == [const.SUBSYSTEM_AV]
+
+    asyncio.run(scenario())
+
+
+# ---- configuration --------------------------------------------------------
+
+
+def test_the_bridge_holds_the_kitchen_slot_not_the_office_one():
+    """Entering Lights makes the AADS light the panel's own room.
+
+    Slot 0x13 was the Office panel and its entry turns on North Sink, so the
+    bridge switched a light on every reconnect, restart and return from A/V.
+    Reproduced three times on 2026-09-22. Slot 0x14 is the Guest Suite and does
+    the same to East Hall, which pde had lived with for years. Slot 0x12, the
+    Kitchen panel, turns nothing on, tested both by hand at the panel and over
+    CIP, so the bridge moved there. No code can prevent this; only the slot
+    choice can.
+    """
+    assert const.DEFAULTS[const.LINK_AADS]["ipid"] == 0x12
+
+
+def test_only_the_aads_link_is_configured_with_subsystems():
     bridge = CrestronBridge({})
-    assert bridge._clients[const.LINK_AADS].entry_join == const.LIGHTS_ENTRY_JOIN
-    assert bridge._clients[const.LINK_MC2E].entry_join is None
+    aads = bridge._clients[const.LINK_AADS]
+    mc2e = bridge._clients[const.LINK_MC2E]
+    assert aads.subsystems == const.ENTRY_JOINS
+    assert aads.default_subsystem == const.SUBSYSTEM_LIGHTS
+    assert aads.forbidden == const.FORBIDDEN_AADS_WRITE
+    assert mc2e.subsystems == {}
+    assert mc2e.default_subsystem is None
+    assert mc2e.forbidden == frozenset()
 
 
-def test_the_entry_join_is_not_one_the_alarm_keypad_shares():
-    """d93 is the entry button for the Alarm subsystem; d91 is the one for Lights."""
-    assert const.LIGHTS_ENTRY_JOIN == 91
-    assert const.LIGHTS_ENTRY_JOIN not in const.FORBIDDEN_AADS_WRITE
+def test_the_entry_joins_are_not_ones_the_alarm_keypad_shares():
+    """d93 is the entry button for the Alarm subsystem; d91 is Lights, d75 A/V."""
+    assert const.ENTRY_JOINS == {const.SUBSYSTEM_LIGHTS: 91, const.SUBSYSTEM_AV: 75}
     assert 93 in const.FORBIDDEN_AADS_WRITE
+    for subsystem, join in const.ENTRY_JOINS.items():
+        assert join not in const.FORBIDDEN_AADS_WRITE, subsystem
+
+
+def test_the_entry_quiet_thresholds_are_the_measured_ones():
+    """Measured 2026-09-22 by mac/poc_subsystem_timing.py across two panel slots.
+
+    No subsystem entry produces the end-of-query marker the registration dump
+    ends with, so quiet is the only signal available and each threshold has to
+    clear the largest gap inside a dump. Worst seen: Lights 0.166s on 0x14 and
+    0.246s on 0x12; A/V 0.352s on 0x14 and 0.419s on 0x12. Each threshold is
+    twice the worse of the two.
+
+    Being wrong here is no longer a correctness bug, because entry merges rather
+    than rebuilds, so a window that closes early just leaves the remaining frames
+    to arrive by the ordinary path. It is still worth keeping honest: these
+    numbers are the record of what the processor actually did.
+    """
+    assert const.ENTRY_QUIET_SECONDS == {const.SUBSYSTEM_LIGHTS: 0.50, const.SUBSYSTEM_AV: 0.85}
+    assert const.ENTRY_TIMEOUT == 3.0
+
+
+def test_an_analog_join_arriving_mid_entry_lands_in_the_subsystem_being_entered():
+    """a11, the per-zone volume, arrives inside the entry window.
+
+    `current_subsystem` is deliberately None while an entry is in flight, so
+    bucketing analogs by it would file every A/V volume reading under unknown.
+    Step 2 reads a11 and would find nothing there.
+    """
+    client = _client()
+    client.dumps[const.AV_ENTRY_JOIN] = {1251: 1}
+
+    async def scenario():
+        entering = asyncio.create_task(client.async_enter(const.SUBSYSTEM_AV))
+        # Land the analog while the entry is still collecting.
+        await asyncio.sleep(0)
+        assert client._collecting is not None
+        await client._handle_data(b"\x00\x00\x08\x14" + b"\x00\x0a\xe6\x66")
+        client.dumps[const.AV_ENTRY_JOIN] = {1251: 1}
+        client._collecting.update({1251: 1})
+        client._last_data_rx = asyncio.get_running_loop().time()
+        assert await entering is True
+
+        assert client.analog_for(const.SUBSYSTEM_AV) == {11: 58982}
+        assert client.analog_for(None) == {}
+
+    asyncio.run(scenario())
+
+
+def test_a_press_cancelled_mid_hold_still_releases_the_join():
+    """A held join is a press-and-hold, and holding is not a no-op on this system.
+
+    It ramps a dimmer, and on a learnable scene button it overwrites the scene.
+    Cancellation during the hold is a real path: closing a session cancels the
+    bring-up task, and that task presses the subsystem-entry join.
+    """
+    written = []
+
+    class FakeWriter:
+        def write(self, packet):
+            written.append(packet)
+
+        async def drain(self):
+            return None
+
+    # Built bare rather than through _client(), whose press wrapper forces the
+    # hold to zero and would finish before a cancellation could land.
+    client = _cip_mod.CipClient(
+        name="test",
+        host="127.0.0.1",
+        port=const.CIP_PORT,
+        ipid=0x13,
+        on_digital=lambda join, value, subsystem: None,
+        subsystems=const.ENTRY_JOINS,
+        default_subsystem=const.SUBSYSTEM_LIGHTS,
+        forbidden=const.FORBIDDEN_AADS_WRITE,
+    )
+    client.connected = True
+    client._writer = FakeWriter()
+
+    async def scenario():
+        press = asyncio.create_task(client._press(const.LIGHTS_ENTRY_JOIN, hold=5.0))
+        await asyncio.sleep(0.05)
+        press.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await press
+        assert written == [
+            digital_packet(const.LIGHTS_ENTRY_JOIN, True),
+            digital_packet(const.LIGHTS_ENTRY_JOIN, False),
+        ], "the join was left held down"
+
+    asyncio.run(scenario())
