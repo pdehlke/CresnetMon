@@ -200,8 +200,15 @@ class AvController:
             VOLUME_ANALOG,
             "present" if VOLUME_ANALOG in self._client.analog_for(SUBSYSTEM_AV) else "absent",
         )
+        # Proceed, but do not cache. Believing an unconfirmed move would let
+        # every later operation in this session take the shortcut above and skip
+        # the press, the s11 check and the analog wait entirely, so a ramp would
+        # spend all twelve of its segments holding d44 against whatever zone the
+        # cursor really sits on while a11 reports that same wrong zone and the
+        # delta never shrinks. Leaving the generation stale costs one idempotent
+        # re-press next time and keeps the check in the path.
         self._cursor = zone.key
-        self._cursor_generation = self._client.generation
+        self._cursor_generation = -1
 
     def _zone(self, key: str) -> Zone:
         zone = ZONES_BY_KEY.get(key)
@@ -353,10 +360,12 @@ class AvController:
                 await self._async_enter()
                 await self._client.async_press(ALL_ZONES_OFF_JOIN, SUBSYSTEM_AV)
                 await asyncio.sleep(CURSOR_SETTLE_SECONDS)
-                # Every zone's state just changed, and only the cursor's is
-                # readable, so there is nothing honest to return here.
-                self._cursor = None
             finally:
+                # Every zone's state just changed, and only the cursor's is
+                # readable, so there is nothing honest to return here. Cleared
+                # in the finally because a press that reached the wire and then
+                # raised changed them just the same.
+                self._cursor = None
                 self._touch()
 
     async def async_set_mute(self, zone_key: str, mute: bool) -> dict[str, object]:

@@ -152,6 +152,13 @@ class CipClient:
         self._collecting_for: str | None = None
         self._end_of_query = asyncio.Event()
         self._write_lock = asyncio.Lock()
+        # There is one collection buffer, so there is one collection at a
+        # time. _bring_up() enters without holding the bridge's per-link
+        # lock, so that lock cannot be what serialises entries against it;
+        # this is. Without it a bring-up and a command retry racing after a
+        # mid-command reconnect overwrite each other's buffer, and the loser
+        # spins to ENTRY_TIMEOUT reporting no joins at all.
+        self._collect_lock = asyncio.Lock()
 
     # ---- state -------------------------------------------------------------
 
@@ -392,6 +399,16 @@ class CipClient:
         if self.current_subsystem == subsystem:
             return True
 
+        async with self._collect_lock:
+            # Re-checked under the lock: whoever we queued behind may have put
+            # the slot exactly where we wanted it, and pressing again would
+            # leave the subsystem rather than re-enter it.
+            if self.current_subsystem == subsystem:
+                return True
+            return await self._enter_locked(subsystem)
+
+    async def _enter_locked(self, subsystem: str) -> bool:
+        """The entry itself. Call only with `_collect_lock` held."""
         join = self.subsystems[subsystem]
         loop = asyncio.get_running_loop()
         _LOGGER.info(
@@ -449,7 +466,7 @@ class CipClient:
         self.current_subsystem = subsystem
         return True
 
-    async def async_repoll(self, subsystem: str | None) -> bool:
+    async def async_repoll(self, subsystem: str) -> bool:
         """Ask the processor to re-send everything, and merge what comes back.
 
         An entry dump is partial and not deterministic: on 2026-09-22 one Lights
@@ -463,9 +480,15 @@ class CipClient:
         Returns False on timeout rather than raising. The caller still has the
         entry dump, which is incomplete but not wrong.
         """
+        async with self._collect_lock:
+            return await self._repoll_locked(subsystem)
+
+    async def _repoll_locked(self, subsystem: str) -> bool:
+        """The re-poll itself. Call only with `_collect_lock` held."""
         self._end_of_query.clear()
         self._collecting = {}
         self._collecting_for = subsystem
+        answered = True
         try:
             await self._send(UPDATE_REQUEST)
             try:
@@ -477,17 +500,21 @@ class CipClient:
                     self.name,
                     REPOLL_TIMEOUT,
                 )
-                return False
+                answered = False
         finally:
             collected, self._collecting = self._collecting or {}, None
             self._collecting_for = None
 
+        # Merged even when the marker never came. _handle_data() diverts every
+        # digital frame into the buffer while a re-poll is open, so returning
+        # early here used to throw away up to REPOLL_TIMEOUT seconds of real
+        # feedback and lose a wall-panel press outright. The entry has already
+        # succeeded by the time _bring_up() re-polls, so these frames belong to
+        # `subsystem` and are not the ambiguous case async_enter() guards
+        # against when it discards a failed entry's collection.
         _LOGGER.debug("%s: re-poll returned %d joins", self.name, len(collected))
-        if subsystem is not None:
-            self._finish_entry(subsystem, collected)
-        else:
-            self._finish_entry_ungated(collected)
-        return True
+        self._finish_entry(subsystem, collected)
+        return answered
 
     def invalidate_subsystem(self) -> None:
         """Forget which subsystem the slot is in, forcing the next write to re-enter.
@@ -506,16 +533,6 @@ class CipClient:
                 self.current_subsystem,
             )
         self.current_subsystem = None
-
-    def _finish_entry_ungated(self, collected: dict[int, int]) -> None:
-        """The same merge for a link with no subsystems, such as the MC2E."""
-        previous = self.digital_for(None)
-        changed = [
-            (join, value) for join, value in collected.items() if previous.get(join) != value
-        ]
-        previous.update(collected)
-        for join, value in changed:
-            self._on_digital(join, value, None)
 
     def _finish_entry(self, subsystem: str, collected: dict[int, int]) -> None:
         """Apply the entry dump to the subsystem's state, reporting what moved.
@@ -656,9 +673,18 @@ class CipClient:
             raise CrestronError(
                 f"{self.name}: refusing to press d{join}, shared with the DSC alarm keypad"
             )
-        await self._send(digital_packet(join, True))
+        # Captured now rather than re-read in the finally. _close() nulls
+        # self._writer *before* it cancels the bring-up task, so a press
+        # cancelled by exactly the path this fallback exists for used to find
+        # nothing there and leave the join held down.
+        writer = self._writer
         released = False
         try:
+            # Inside the try, because StreamWriter.drain() yields when the
+            # transport is closing, which is the moment _close() cancels us. A
+            # cancellation landing there leaves the press queued, and sending it
+            # outside the try meant the release below was never reached.
+            await self._send(digital_packet(join, True))
             await asyncio.sleep(hold)
             await self._send(digital_packet(join, False))
             released = True
@@ -675,7 +701,10 @@ class CipClient:
                 # a cancellation already in flight would preempt it. write() is
                 # not a coroutine and appends a whole packet, so it cannot be
                 # interrupted or interleaved part-way.
-                writer = self._writer
+                #
+                # Releasing a join that never actually went down is a no-op on
+                # the wire, so it is safe to do this even when the press itself
+                # is what failed.
                 if writer is not None:
                     with contextlib.suppress(Exception):
                         writer.write(digital_packet(join, False))

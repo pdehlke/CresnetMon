@@ -21,6 +21,7 @@ as that operation ends and needs no interrupt protocol to get there.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Callable
 
@@ -100,8 +101,14 @@ class CrestronBridge:
 
     async def async_stop(self) -> None:
         if self._idle_task:
-            self._idle_task.cancel()
-            self._idle_task = None
+            # Awaited, not just cancelled. The client teardown below yields, so
+            # an unawaited idle task would take its CancelledError while
+            # _close() is nulling the writer out from under whatever press it
+            # was in the middle of. CipClient.async_stop() already does this.
+            idle, self._idle_task = self._idle_task, None
+            idle.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await idle
         for client in self._clients.values():
             await client.async_stop()
 
@@ -232,6 +239,13 @@ class CrestronBridge:
                     if now - self._activity[link] < IDLE_RETURN_SECONDS:
                         continue
                     async with self._locks[link]:
+                        # Rechecked in full. The pre-checks above are what make
+                        # this acquire uncontended and therefore non-yielding,
+                        # so nothing can change underneath today; a recheck that
+                        # covered only the subsystem would quietly stop being
+                        # enough the moment that skip became a wait.
+                        if not self.link_connected(link):
+                            continue
                         if client.current_subsystem in (None, default):
                             continue
                         _LOGGER.info(
@@ -277,6 +291,18 @@ class CrestronBridge:
         async with self._locks[load.link]:
             try:
                 for attempt in range(1, CONFIRM_ATTEMPTS + 1):
+                    # Revalidated every attempt, not just before the lock. The
+                    # confirmation wait below is three seconds long, which is
+                    # ample for the session to drop, reconnect and start a
+                    # bring-up; carrying on into that would have this retry and
+                    # the bring-up entering the slot at the same time. The
+                    # client serialises the collection buffer itself now, so
+                    # this is about failing the command honestly rather than
+                    # about the buffer.
+                    if not (client.connected and client.synced):
+                        raise CrestronError(
+                            f"{key}: the {load.link} link dropped mid-command"
+                        )
                     # First thing every attempt, because the state this reads
                     # next is only trustworthy once the subsystem's own dump has
                     # landed, and because a retry after an unconfirmed press gets
