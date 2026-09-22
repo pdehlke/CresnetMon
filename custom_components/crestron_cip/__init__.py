@@ -27,7 +27,15 @@ from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.typing import ConfigType
 
 from .bridge import CrestronBridge, CrestronError
-from .const import DOMAIN, ENTRY_JOINS, LINK_AADS, LINK_MC2E, LOADS_BY_KEY
+from .const import (
+    AV_SOURCES,
+    DOMAIN,
+    ENTRY_JOINS,
+    LINK_AADS,
+    LINK_MC2E,
+    LOADS_BY_KEY,
+    ZONES_BY_KEY,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +44,10 @@ ATTR_LOAD = "load"
 ATTR_LINK = "link"
 ATTR_SUBSYSTEM = "subsystem"
 ATTR_HOLD_SECONDS = "hold_seconds"
+ATTR_ZONE = "zone"
+ATTR_SOURCE = "source"
+ATTR_VOLUME = "volume"
+ATTR_MUTE = "mute"
 
 _LINK_SCHEMA = vol.Schema(
     {
@@ -67,6 +79,20 @@ _ENTER_SCHEMA = vol.Schema(
         ),
     }
 )
+
+
+_ZONE = vol.In(sorted(ZONES_BY_KEY))
+_ZONE_SCHEMA = vol.Schema({vol.Required(ATTR_ZONE): _ZONE})
+_SOURCE_SCHEMA = vol.Schema(
+    {vol.Required(ATTR_ZONE): _ZONE, vol.Required(ATTR_SOURCE): vol.In(list(AV_SOURCES))}
+)
+_VOLUME_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ZONE): _ZONE,
+        vol.Required(ATTR_VOLUME): vol.All(vol.Coerce(float), vol.Range(min=0, max=100)),
+    }
+)
+_MUTE_SCHEMA = vol.Schema({vol.Required(ATTR_ZONE): _ZONE, vol.Required(ATTR_MUTE): cv.boolean})
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -129,6 +155,44 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _ENTER_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
+
+    def _av(method, *fields):
+        """Wrap an A/V bridge method as a response-returning service handler.
+
+        Every one of these returns the zone's state afterwards rather than only
+        succeeding, because only the cursor's zone is readable at all and a
+        caller that just moved the cursor is the one caller guaranteed to be
+        able to see the result.
+        """
+
+        async def handle(call: ServiceCall) -> dict[str, object]:
+            try:
+                return await method(*(call.data[field] for field in fields)) or {}
+            except CrestronError as err:
+                raise HomeAssistantError(str(err)) from err
+
+        return handle
+
+    for name, method, schema, fields in (
+        ("av_status", bridge.av.async_status, _ZONE_SCHEMA, (ATTR_ZONE,)),
+        (
+            "av_select_source",
+            bridge.av.async_select_source,
+            _SOURCE_SCHEMA,
+            (ATTR_ZONE, ATTR_SOURCE),
+        ),
+        ("av_set_volume", bridge.av.async_set_volume, _VOLUME_SCHEMA, (ATTR_ZONE, ATTR_VOLUME)),
+        ("av_power_off", bridge.av.async_power_off, _ZONE_SCHEMA, (ATTR_ZONE,)),
+        ("av_power_off_all", bridge.av.async_power_off_all, vol.Schema({}), ()),
+        ("av_mute", bridge.av.async_set_mute, _MUTE_SCHEMA, (ATTR_ZONE, ATTR_MUTE)),
+    ):
+        hass.services.async_register(
+            DOMAIN,
+            name,
+            _av(method, *fields),
+            schema,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
 
     hass.async_create_task(async_load_platform(hass, Platform.BINARY_SENSOR, DOMAIN, {}, config))
 

@@ -86,3 +86,163 @@ enter_subsystem:
           unit_of_measurement: s
   response:
     optional: true
+
+
+av_status:
+  name: Read an audio zone
+  description: >-
+    Report one zone's source, volume and mute state. The AADS exposes one zone
+    at a time through a per-slot cursor, so this moves the cursor onto the zone
+    first. That does not disturb the physical panels, which carry cursors of
+    their own.
+  fields:
+    zone:
+      name: Zone
+      description: Which audio zone to act on.
+      required: true
+      example: studio
+      selector:
+        select:
+          options:
+            - kitchen
+            - outdoor_kitchen
+            - master_bed
+            - master_bath
+            - studio
+            - courtyard
+  response:
+    optional: true
+
+av_select_source:
+  name: Select a source in an audio zone
+  description: >-
+    Select a source, which also powers the zone on: source select and power on
+    are one action on this system, and only power off is separate. The zone's
+    volume is replaced by the AADS's preset for that source, so set the volume
+    after this and never before.
+  fields:
+    zone:
+      name: Zone
+      description: Which audio zone to act on.
+      required: true
+      example: studio
+      selector:
+        select:
+          options:
+            - kitchen
+            - outdoor_kitchen
+            - master_bed
+            - master_bath
+            - studio
+            - courtyard
+    source:
+      name: Source
+      description: >-
+        Source number, 1 to 6. Source identity beyond AirPlay is unresolved: the
+        AADS and Integra wiring was customised and the Integra's input labels do
+        not match what they select.
+      required: true
+      example: 2
+      selector:
+        number:
+          min: 1
+          max: 6
+  response:
+    optional: true
+
+av_set_volume:
+  name: Set an audio zone's volume
+  description: >-
+    Ramp a zone to a percentage of full scale and converge on it. The volume
+    join accepts no direct write, so this holds the up or down button for a
+    computed time and corrects against what the processor then reports, giving
+    the slot back between segments so lighting commands are not held up. The
+    speakers are inaudible below roughly 80 percent, so the useful span is the
+    top fifth.
+  fields:
+    zone:
+      name: Zone
+      description: Which audio zone to act on.
+      required: true
+      example: studio
+      selector:
+        select:
+          options:
+            - kitchen
+            - outdoor_kitchen
+            - master_bed
+            - master_bath
+            - studio
+            - courtyard
+    volume:
+      name: Volume
+      description: Target level as a percentage of full scale.
+      required: true
+      example: 90
+      selector:
+        number:
+          min: 0
+          max: 100
+          unit_of_measurement: "%"
+  response:
+    optional: true
+
+av_power_off:
+  name: Power off an audio zone
+  description: >-
+    Power one zone off. This clears the zone's remembered source rather than
+    only silencing it, and there is no join path back to "off with a source
+    remembered", because restoring the source powers the zone on again.
+  fields:
+    zone:
+      name: Zone
+      description: Which audio zone to act on.
+      required: true
+      example: studio
+      selector:
+        select:
+          options:
+            - kitchen
+            - outdoor_kitchen
+            - master_bed
+            - master_bath
+            - studio
+            - courtyard
+  response:
+    optional: true
+
+av_power_off_all:
+  name: Power off every audio zone
+  description: >-
+    Power all six zones off with a single press. Returns nothing, because only
+    the cursor's zone is readable and every zone's state just changed.
+
+av_mute:
+  name: Mute or unmute an audio zone
+  description: >-
+    Set a zone's mute state. The mute button is a toggle, so this consults the
+    live feedback first and presses only when it differs.
+  fields:
+    zone:
+      name: Zone
+      description: Which audio zone to act on.
+      required: true
+      example: studio
+      selector:
+        select:
+          options:
+            - kitchen
+            - outdoor_kitchen
+            - master_bed
+            - master_bath
+            - studio
+            - courtyard
+    mute:
+      name: Mute
+      description: True to mute, false to unmute.
+      required: true
+      example: true
+      selector:
+        boolean:
+  response:
+    optional: true

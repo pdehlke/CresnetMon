@@ -131,6 +131,15 @@ class CipClient:
 
         self.connected = False
         self.synced = False
+        # Bumped on every new session. The A/V cursor is per slot and no
+        # physical panel can move ours, so a cached cursor position stays
+        # true for as long as one session lives and for no longer.
+        self.generation = 0
+        # Counts analog frames received, not values changed. A cursor move
+        # that lands on a zone holding the same volume as the last one sends
+        # a frame carrying an identical value, and 'the processor has spoken
+        # since the press' is the only question worth asking.
+        self.analog_rx = 0
 
         self._writer: asyncio.StreamWriter | None = None
         self._task: asyncio.Task | None = None
@@ -242,6 +251,7 @@ class CipClient:
         self._writer = writer
         self.connected = True
         self.synced = False
+        self.generation += 1
         self.current_subsystem = None
         self._collecting = None
         self._collecting_for = None
@@ -600,11 +610,13 @@ class CipClient:
                 if previous != value:
                     self._on_digital(join, value, self.current_subsystem)
         elif datatype == 0x14:
+            self.analog_rx += 1
             bucket = self.analog_for(self._incoming)
             for i in range(0, len(body) - 3, 4):
                 join = ((body[i] << 8) | body[i + 1]) + 1
                 bucket[join] = (body[i + 2] << 8) | body[i + 3]
         elif datatype == 0x01:
+            self.analog_rx += 1
             self.analog_for(self._incoming)[body[0] + 1] = (body[1] << 8) | body[2]
         elif datatype == 0x15:
             # The join is 0-based on the wire like every other type here; this

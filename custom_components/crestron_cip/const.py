@@ -148,6 +148,117 @@ DEFAULTS = {
 FORBIDDEN_AADS_WRITE = frozenset(range(130, 149)) | {93}
 
 
+# ---- A/V ------------------------------------------------------------------
+#
+# The same TSW-752 panel project that gave up the lighting joins also carries
+# room-by-room audio for the AADS's six zones, on the same CIP route. Map and
+# live evidence in the pdehlke/homeassistant repo at
+# docs/crestron/crestron-av-zone-control-path.md.
+#
+# Living Room is deliberately absent and cannot be added: it is driven by an
+# external Integra receiver wired into the AADS as one fixed line input, so
+# Crestron can move that feed around the house but cannot change what it plays.
+
+
+@dataclass(frozen=True)
+class Zone:
+    """One audio zone and the join that moves the slot's cursor onto it.
+
+    `name` is what the processor reports on s11 once the cursor lands, and is
+    checked rather than assumed, because a cursor move that silently failed
+    would otherwise have every later read attributed to the wrong room.
+    """
+
+    key: str
+    name: str
+    select_join: int
+
+
+ZONES: tuple[Zone, ...] = (
+    Zone("kitchen", "Kitchen", 951),
+    Zone("outdoor_kitchen", "Outdoor Kitchen", 952),
+    Zone("master_bed", "Master Bed", 953),
+    Zone("master_bath", "Master Bath", 954),
+    Zone("studio", "Studio", 955),
+    Zone("courtyard", "Courtyard", 956),
+)
+ZONES_BY_KEY: dict[str, Zone] = {zone.key: zone for zone in ZONES}
+
+# Source numbering is regular: source N presses d(50+N), publishes its name on
+# s(100+N), and raises d10N1 when it is the selected source. Confirmed live for
+# N=1 and N=5. The project defines d51-d74, but the live six-tile subpage only
+# wires d51-d56, so only those are reachable from this panel layout.
+AV_SOURCES = range(1, 7)
+AV_NO_SOURCE_JOIN = 1001
+
+
+def source_press_join(source: int) -> int:
+    return 50 + source
+
+
+def source_feedback_join(source: int) -> int:
+    return 1000 + source * 10 + 1
+
+
+def source_name_serial(source: int) -> int:
+    return 100 + source
+
+
+VOLUME_UP_JOIN = 44
+VOLUME_DOWN_JOIN = 45
+MUTE_JOIN = 48
+MUTE_FEEDBACK_JOIN = 46
+ZONE_POWER_OFF_JOIN = 42
+ALL_ZONES_OFF_JOIN = 40
+
+ZONE_NAME_SERIAL = 11
+SOURCE_NAME_SERIAL = 16
+VOLUME_ANALOG = 11
+
+# The AADS works internally in percent with 65535 as 100: selecting Tuner 1
+# applied a preset of exactly 26214, which is 40.000% of full scale. So percent
+# is the honest unit for a service to take, not the raw join and not a rescaling
+# onto the audible span.
+VOLUME_FULL_SCALE = 65535
+
+# a11 accepts no direct write. Both analog joins in all 52 pages are feedback
+# only, and there is no way to set a level numerically from a physical panel
+# either, so setting one means holding d44 or d45 and converging against a11.
+# Measured at about 6570 units per second of hold, linear, consistent in both
+# directions.
+VOLUME_RAMP_UNITS_PER_SECOND = 6570.0
+
+# One minimum-length press moves about 800 units, so a tolerance below that
+# would oscillate around the target forever. This is a little over one press.
+VOLUME_TOLERANCE = 1000
+VOLUME_MAX_SEGMENTS = 12
+
+# Per pde, the speakers are inaudible below roughly 80% of full scale on
+# AirPlay. Anything under this is accepted and acted on, and warned about, since
+# asking for it is more likely a unit mix-up than an intention.
+VOLUME_AUDIBLE_FLOOR_PERCENT = 80.0
+
+# A cursor move blanks the per-zone joins for about 60ms before repopulating
+# them. Anything read inside that window reports a dead zone with full
+# confidence, which is the same silent failure the lighting subsystem gate
+# produced on 2026-09-15. This is the margin over that, not the measurement.
+CURSOR_SETTLE_SECONDS = 0.40
+CURSOR_CONFIRM_TIMEOUT = 3.0
+
+# No single operation may hold the slot lock for longer than this. A lighting
+# write queued behind an A/V one waits at most this plus one entry to Lights, so
+# worst-case added lighting latency stays around two seconds. It is also the cap
+# on a single volume ramp segment, which is why a nine-second ramp is chopped
+# into pieces that each give the slot back.
+MAX_HOLD_SECONDS = 1.0
+
+AV_WRITE_JOINS = frozenset(
+    {VOLUME_UP_JOIN, VOLUME_DOWN_JOIN, MUTE_JOIN, ZONE_POWER_OFF_JOIN, ALL_ZONES_OFF_JOIN}
+    | {zone.select_join for zone in ZONES}
+    | {source_press_join(n) for n in AV_SOURCES}
+)
+
+
 @dataclass(frozen=True)
 class Load:
     """One physical lighting load and the joins that address it.
@@ -371,6 +482,16 @@ def _validate() -> None:
     missing = set(ENTRY_QUIET_SECONDS) ^ set(ENTRY_JOINS)
     if missing:
         raise ValueError(f"no measured entry quiet threshold for {sorted(missing)}")
+
+    forbidden = sorted(AV_WRITE_JOINS & FORBIDDEN_AADS_WRITE)
+    if forbidden:
+        raise ValueError(f"A/V would press {forbidden}, which the DSC alarm keypad shares")
+    zone_joins = {zone.select_join for zone in ZONES}
+    if len(zone_joins) != len(ZONES):
+        raise ValueError("two zones share a select join")
+    for zone in ZONES:
+        if not zone.name.strip():
+            raise ValueError(f"zone {zone.key} has no name to confirm a cursor move against")
 
     seen: dict[tuple[str, int], str] = {}
     for load in LOADS:

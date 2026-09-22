@@ -1092,3 +1092,461 @@ def test_a_press_cancelled_mid_hold_still_releases_the_join():
         ], "the join was left held down"
 
     asyncio.run(scenario())
+
+
+# ---- A/V zones ------------------------------------------------------------
+#
+# Six audio zones behind one per-slot cursor. Only the cursor's zone is
+# readable, so every operation names its zone and moves the cursor there first.
+# Map and live evidence in the pdehlke/homeassistant repo at
+# docs/crestron/crestron-av-zone-control-path.md.
+
+_av_mod = importlib.import_module("crestron_cip.av")
+AvController = _av_mod.AvController
+
+
+@pytest.fixture(autouse=True)
+def _fast_cursor(monkeypatch):
+    """The 0.40s cursor settle is margin over a measured 60ms blank, not a test cost."""
+    monkeypatch.setattr(_av_mod, "CURSOR_SETTLE_SECONDS", 0.01)
+    monkeypatch.setattr(_av_mod, "CURSOR_CONFIRM_TIMEOUT", 0.5)
+
+
+class FakeAvClient:
+    """Models the AADS's audio behaviour closely enough to test the controller.
+
+    The parts that matter are the ones that bit in the field: a zone select
+    repoints every per-zone join, a source select powers the zone on and
+    overwrites its volume with that source's preset, and the volume join moves
+    by the hold duration rather than stepping.
+    """
+
+    PRESETS = {1: 30000, 2: 52000, 5: 26214}
+
+    def __init__(self):
+        self.name = "aads"
+        self.connected = True
+        self.synced = True
+        self.generation = 1
+        self.analog_rx = 0
+        self.subsystems = dict(const.ENTRY_JOINS)
+        self.default_subsystem = const.SUBSYSTEM_LIGHTS
+        self.current_subsystem = const.SUBSYSTEM_LIGHTS
+        self.serial: dict[int, str] = {}
+        self.presses: list[tuple[int, float]] = []
+        self.entries: list[str] = []
+        self._digital: dict[str, dict[int, int]] = {}
+        self._analog: dict[str, dict[int, int]] = {}
+        # Per-zone truth the processor holds and reveals one zone at a time.
+        self.volumes = dict.fromkeys(ZONE_KEYS, 0)
+        # a11 and s11 do not arrive together on real hardware.
+        self.volume_arrives_after = 0.0
+        self.sources: dict[str, int | None] = dict.fromkeys(ZONE_KEYS, None)
+        self.cursor: str | None = None
+
+    def digital_for(self, subsystem):
+        return self._digital.setdefault(subsystem, {})
+
+    def analog_for(self, subsystem):
+        return self._analog.setdefault(subsystem, {})
+
+    async def async_enter(self, subsystem):
+        if self.current_subsystem != subsystem:
+            self.entries.append(subsystem)
+            self.current_subsystem = subsystem
+        return True
+
+    def _publish(self):
+        """Repoint the per-zone joins at the cursor's zone, and only those.
+
+        d51-d56 are per-zone feedback and blank and repopulate on a cursor move.
+        The d10N1 family selects the per-source display page, which is slot
+        state: it stays where the last source press left it no matter where the
+        cursor goes. Modelling that difference is the point, because conflating
+        them had every zone reporting whatever Studio was playing.
+        """
+        av = self.digital_for(const.SUBSYSTEM_AV)
+        for source in const.AV_SOURCES:
+            av[const.source_press_join(source)] = 0
+        source = self.sources[self.cursor]
+        if source:
+            av[const.source_press_join(source)] = 1
+        self._publish_volume()
+
+    def _publish_page(self, source):
+        av = self.digital_for(const.SUBSYSTEM_AV)
+        for other in const.AV_SOURCES:
+            av[const.source_feedback_join(other)] = 0
+        av[const.AV_NO_SOURCE_JOIN] = 0 if source else 1
+        if source:
+            av[const.source_feedback_join(source)] = 1
+
+    def _publish_volume(self):
+        def deliver(value):
+            self.analog_rx += 1
+            self.analog_for(const.SUBSYSTEM_AV)[const.VOLUME_ANALOG] = value
+
+        if not self.volume_arrives_after:
+            deliver(self.volumes[self.cursor])
+            return
+        zone, value = self.cursor, self.volumes[self.cursor]
+        asyncio.get_running_loop().call_later(
+            self.volume_arrives_after,
+            lambda: deliver(value) if self.cursor == zone else None,
+        )
+
+    async def async_press(self, join, subsystem, hold=0.12):
+        assert subsystem == self.current_subsystem, "pressed in the wrong subsystem"
+        self.presses.append((join, round(hold, 3)))
+
+        for zone in const.ZONES:
+            if join == zone.select_join:
+                self.cursor = zone.key
+                self.serial[const.ZONE_NAME_SERIAL] = zone.name
+                self._publish()
+                return
+
+        if self.cursor is None:
+            return
+        if join in (const.VOLUME_UP_JOIN, const.VOLUME_DOWN_JOIN):
+            step = round(hold * const.VOLUME_RAMP_UNITS_PER_SECOND)
+            moved = self.volumes[self.cursor] + (step if join == const.VOLUME_UP_JOIN else -step)
+            self.volumes[self.cursor] = max(0, min(const.VOLUME_FULL_SCALE, moved))
+            self._publish()
+            return
+        for source in const.AV_SOURCES:
+            if join == const.source_press_join(source):
+                self.sources[self.cursor] = source
+                self.volumes[self.cursor] = self.PRESETS.get(source, 40000)
+                self._publish()
+                self._publish_page(source)
+                return
+        if join == const.ZONE_POWER_OFF_JOIN:
+            self.sources[self.cursor] = None
+            self._publish()
+            self._publish_page(None)
+            self.digital_for(const.SUBSYSTEM_AV)[const.ZONE_POWER_OFF_JOIN] = 1
+            return
+        if join == const.MUTE_JOIN:
+            av = self.digital_for(const.SUBSYSTEM_AV)
+            av[const.MUTE_FEEDBACK_JOIN] = 0 if av.get(const.MUTE_FEEDBACK_JOIN) else 1
+
+
+ZONE_KEYS = [zone.key for zone in const.ZONES]
+
+
+def make_av():
+    client = FakeAvClient()
+    lock = asyncio.Lock()
+    return client, AvController(client, lock, lambda: None), lock
+
+
+def test_the_zone_table_matches_the_mapped_joins():
+    assert [(z.key, z.name, z.select_join) for z in const.ZONES] == [
+        ("kitchen", "Kitchen", 951),
+        ("outdoor_kitchen", "Outdoor Kitchen", 952),
+        ("master_bed", "Master Bed", 953),
+        ("master_bath", "Master Bath", 954),
+        ("studio", "Studio", 955),
+        ("courtyard", "Courtyard", 956),
+    ]
+    # Source N presses d(50+N), names on s(100+N), reports on d10N1. Confirmed
+    # live for N=1 and N=5.
+    assert const.source_press_join(1) == 51
+    assert const.source_feedback_join(1) == 1011
+    assert const.source_feedback_join(5) == 1051
+    assert const.source_name_serial(7) == 107
+
+
+def test_no_av_join_is_one_the_alarm_keypad_shares():
+    assert not (const.AV_WRITE_JOINS & const.FORBIDDEN_AADS_WRITE)
+
+
+def test_volume_is_a_percentage_of_full_scale():
+    """The AADS works in percent internally: Tuner 1's preset was 40.000%."""
+    assert _av_mod.percent_to_raw(90) == 58982
+    assert _av_mod.percent_to_raw(40) == 26214
+    assert _av_mod.raw_to_percent(26214) == 40.0
+
+
+def test_reading_a_zone_enters_av_and_moves_the_cursor():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 58982
+
+    result = asyncio.run(av.async_status("studio"))
+    assert client.entries == [const.SUBSYSTEM_AV]
+    assert client.presses == [(955, 0.12)]
+    assert result["zone"] == "studio"
+    assert result["source"] == 2
+    assert result["volume"] == 58982
+    assert result["volume_percent"] == 90.0
+    assert result["powered"] is True
+
+
+def test_a_second_read_of_the_same_zone_does_not_move_the_cursor_again():
+    """No physical panel can move this slot's cursor, so the cache is exact."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_status("studio")
+        await av.async_status("studio")
+        assert client.presses == [(955, 0.12)]
+        await av.async_status("courtyard")
+        assert client.presses == [(955, 0.12), (956, 0.12)]
+
+    asyncio.run(scenario())
+
+
+def test_a_new_session_invalidates_the_cached_cursor():
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_status("studio")
+        client.generation += 1  # what a reconnect does
+        client.cursor = None
+        await av.async_status("studio")
+        assert client.presses == [(955, 0.12), (955, 0.12)]
+
+    asyncio.run(scenario())
+
+
+def test_selecting_a_source_powers_the_zone_on_and_resets_its_volume():
+    """Source select and power on are one action, and the AADS applies a preset."""
+    client, av, _ = make_av()
+    client.volumes["studio"] = 58982
+
+    result = asyncio.run(av.async_select_source("studio", 5))
+    assert result["powered"] is True
+    assert result["source"] == 5
+    # 26214 is Tuner 1's measured preset, not the 58982 the zone was at.
+    assert result["volume"] == 26214
+
+
+def test_selecting_the_source_a_zone_already_has_presses_nothing():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+
+    asyncio.run(av.async_select_source("studio", 2))
+    assert client.presses == [(955, 0.12)], "re-pressed a source that was already selected"
+
+
+def test_a_zone_is_read_from_its_own_joins_not_the_panel_page():
+    """The bug the six-zone walk exposed on 2026-09-22.
+
+    Selecting AirPlay in Studio raised d1021, the AirPlay display page, and that
+    join is slot state: it stayed high as the cursor moved, so every other zone
+    reported itself as playing AirPlay while all five were off. The per-zone
+    truth is d51-d56, the same joins that take the presses.
+    """
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_select_source("studio", 2)
+        # The panel is still showing AirPlay's page, and will keep showing it.
+        assert client.digital_for(const.SUBSYSTEM_AV)[const.source_feedback_join(2)] == 1
+
+        kitchen = await av.async_status("kitchen")
+        assert kitchen["source"] is None, "read the panel's page instead of the zone"
+        assert kitchen["powered"] is False
+        assert kitchen["displayed_source_page"] == 2, "expected the page join to be slot state"
+
+        studio = await av.async_status("studio")
+        assert studio["source"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_an_unknown_zone_or_source_is_refused():
+    _, av, _ = make_av()
+    with pytest.raises(CrestronError, match="unknown audio zone"):
+        asyncio.run(av.async_status("living_room"))
+    with pytest.raises(CrestronError, match="not one of"):
+        asyncio.run(av.async_select_source("studio", 9))
+
+
+def test_volume_ramps_from_cold_and_converges_on_the_target():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 0
+
+    result = asyncio.run(av.async_set_volume("studio", 90))
+    assert abs(result["volume"] - 58982) <= const.VOLUME_TOLERANCE
+
+    holds = [hold for join, hold in client.presses if join == const.VOLUME_UP_JOIN]
+    assert holds, "never pressed volume up"
+    assert max(holds) <= const.MAX_HOLD_SECONDS, "held the slot longer than the budget"
+    # About nine seconds of ramp at 6570 units/s, so it cannot be one press.
+    assert len(holds) >= 9, f"expected the ramp to be chopped up, got {holds}"
+
+
+def test_volume_ramps_downward_too():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 58982
+
+    result = asyncio.run(av.async_set_volume("studio", 40))
+    assert abs(result["volume"] - 26214) <= const.VOLUME_TOLERANCE
+    assert any(join == const.VOLUME_DOWN_JOIN for join, _ in client.presses)
+
+
+def test_volume_already_at_target_presses_nothing():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 58982
+
+    asyncio.run(av.async_set_volume("studio", 90))
+    assert client.presses == [(955, 0.12)]
+
+
+def test_a_ramp_gives_the_slot_back_between_segments():
+    """A nine-second ramp must not mean nine seconds of lighting latency.
+
+    The whole yielding design rests on operations being short and the lock
+    being fair, so this asserts the lock is actually released mid-ramp rather
+    than held for the duration.
+    """
+    client, av, lock = make_av()
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 0
+    acquired_during_ramp = []
+
+    async def competing_lighting_write():
+        await asyncio.sleep(0.05)
+        await lock.acquire()
+        acquired_during_ramp.append(len(client.presses))
+        lock.release()
+
+    async def scenario():
+        await asyncio.gather(av.async_set_volume("studio", 90), competing_lighting_write())
+
+    asyncio.run(scenario())
+    assert acquired_during_ramp, "the competing write never got the lock"
+    assert acquired_during_ramp[0] < len(client.presses), (
+        "the lock only came free once the whole ramp had finished"
+    )
+
+
+def test_a_zone_whose_level_matches_the_last_one_is_not_waited_on_forever():
+    """Master Bed and Master Bath both sat at 61018, and the move sent nothing.
+
+    The processor has no reason to report a value that did not change, so a
+    cursor move between two zones at the same level produces no analog frame at
+    all. Waiting for one would time out on a reading that was already correct,
+    which is what a live read of Master Bath did on 2026-09-22.
+    """
+    client, av, _ = make_av()
+    client.volumes["master_bed"] = 61018
+    client.volumes["master_bath"] = 61018
+
+    async def scenario():
+        await av.async_status("master_bed")
+        original = client._publish_volume
+        client._publish_volume = lambda: None  # the processor stays silent
+        try:
+            result = await av.async_status("master_bath")
+        finally:
+            client._publish_volume = original
+        assert result["volume"] == 61018
+        assert result["zone"] == "master_bath"
+
+    asyncio.run(scenario())
+
+
+def test_a_read_waits_for_the_volume_to_arrive_after_a_cursor_move():
+    """s11 and a11 do not land together, and the first read after entering A/V caught it.
+
+    Live on 2026-09-22, Kitchen came back with volume None on the first read of
+    a session and 58331 on every read after. Confirming the cursor on the zone
+    name alone reports a zone with no level, and would make a volume ramp refuse
+    to start for a reason that has nothing to do with the zone.
+    """
+    client, av, _ = make_av()
+    client.volumes["studio"] = 58982
+    client.volume_arrives_after = 0.15
+
+    result = asyncio.run(av.async_status("studio"))
+    assert result["volume"] == 58982, "read the zone before its level had arrived"
+
+
+def test_volume_refuses_to_ramp_when_the_zone_reports_no_level():
+    """Reading inside the 60ms cursor blank reports a dead zone confidently."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_status("studio")
+        client.analog_for(const.SUBSYSTEM_AV).pop(const.VOLUME_ANALOG)
+        with pytest.raises(CrestronError, match="refusing to ramp blind"):
+            await av.async_set_volume("studio", 90)
+
+    asyncio.run(scenario())
+
+
+def test_volume_outside_the_scale_is_refused():
+    _, av, _ = make_av()
+    with pytest.raises(CrestronError, match="outside 0-100"):
+        asyncio.run(av.async_set_volume("studio", 120))
+
+
+def test_powering_a_zone_off_clears_its_source():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+
+    result = asyncio.run(av.async_power_off("studio"))
+    assert result["powered"] is False
+    assert result["source"] is None
+
+
+def test_mute_consults_the_feedback_before_pressing_a_toggle():
+    client, av, _ = make_av()
+    client.sources["studio"] = 2
+
+    async def scenario():
+        await av.async_set_mute("studio", True)
+        pressed = [j for j, _ in client.presses if j == const.MUTE_JOIN]
+        assert pressed == [const.MUTE_JOIN]
+        await av.async_set_mute("studio", True)
+        pressed = [j for j, _ in client.presses if j == const.MUTE_JOIN]
+        assert pressed == [const.MUTE_JOIN], "pressed a toggle that was already where it should be"
+
+    asyncio.run(scenario())
+
+
+def test_every_av_operation_enters_the_av_subsystem_first():
+    """A lighting join emitted from A/V, or the reverse, is the collision to avoid.
+
+    FakeAvClient.async_press asserts the subsystem matches, so reaching the
+    press at all is the check; this pins that every entry point does it.
+    """
+    for call in (
+        lambda av: av.async_status("studio"),
+        lambda av: av.async_select_source("studio", 2),
+        lambda av: av.async_power_off("studio"),
+        lambda av: av.async_set_mute("studio", True),
+        lambda av: av.async_power_off_all(),
+    ):
+        client, av, _ = make_av()
+        asyncio.run(call(av))
+        assert client.entries == [const.SUBSYSTEM_AV]
+        assert client.current_subsystem == const.SUBSYSTEM_AV
+
+
+def test_powering_everything_off_forgets_the_cursor():
+    """Every zone's state just changed and only one of them is readable."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_status("studio")
+        await av.async_power_off_all()
+        assert (const.ALL_ZONES_OFF_JOIN, 0.12) in client.presses
+        await av.async_status("studio")
+        assert [j for j, _ in client.presses].count(955) == 2
+
+    asyncio.run(scenario())
+
+
+def test_av_operations_refuse_a_disconnected_link():
+    client, av, _ = make_av()
+    client.synced = False
+    with pytest.raises(CrestronError, match="not connected"):
+        asyncio.run(av.async_status("studio"))

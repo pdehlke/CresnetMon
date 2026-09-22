@@ -24,6 +24,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from .av import AvController
 from .cip import CipClient, CrestronError
 from .const import (
     CIP_PORT,
@@ -81,6 +82,14 @@ class CrestronBridge:
             )
             self._locks[link] = asyncio.Lock()
             self._activity[link] = 0.0
+
+        # Audio shares the AADS slot with lighting by taking turns, so it takes
+        # that link's lock rather than owning anything of its own.
+        self.av = AvController(
+            self._clients[LINK_AADS],
+            self._locks[LINK_AADS],
+            lambda: self._touch(LINK_AADS),
+        )
 
     # ---- lifecycle ---------------------------------------------------------
 
