@@ -10,7 +10,7 @@ import socket
 import sys
 import time
 
-from cip_xpanel import PORT, Listener
+from cip_xpanel import AADS_HOST, PORT, Listener
 from poc_joinpress import HOLD_SECONDS, digital, pump
 
 # 5-SEC (ALARM-DSC-pg01-main) uses d130-d141 and d146-d148; d93 enters the
@@ -25,7 +25,7 @@ BRIDGE_IPID = 0x12
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--join", type=int, required=True)
-ap.add_argument("--host", default="192.168.4.61")
+ap.add_argument("--host", default=AADS_HOST)
 ap.add_argument("--ipid", type=lambda s: int(s, 0), default=0x13)
 ap.add_argument(
     "--allow-bridge-slot",

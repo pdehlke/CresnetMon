@@ -2,7 +2,7 @@
 
 Refuses telnet option negotiation rather than implementing it, sends each
 argument as one command line, and prints everything that comes back. Used
-against the MC2E (192.168.4.59), the AADS (192.168.4.61) and the TSW-752 panels
+against the MC2E (192.168.4.59), the AADS (192.168.4.65) and the TSW-752 panels
 (port 23), none of which ask for a password.
 
 Read-only by intent: nothing here sends a command that changes processor or

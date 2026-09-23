@@ -87,7 +87,7 @@ Blind join probing was safe against the MC2E; assume it is not safe there.
 
 Open, and genuinely unknown here: which host the 752 impersonation registers
 against. The MC2E's `.dsc` lists only `IP-ID-03` and `IP-ID-05`, so it is
-probably the AADS at `192.168.4.61` rather than the MC2E, which would put the
+probably the AADS at `192.168.4.65` rather than the MC2E, which would put the
 Kitchen work and the rest of the house on two different systems. That is an
 inference, not a fact, and it should be confirmed before it is relied on.
 

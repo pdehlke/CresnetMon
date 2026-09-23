@@ -57,7 +57,11 @@ if sys.version_info < (3, 10):  # noqa: UP036 - the point is the interpreter tha
         "cd mac && uv run python poc_subsystem_timing.py"
     )
 
-HOST, PORT = "192.168.4.61", 41794
+# Imported rather than restated: a second copy of this address is how the alarm
+# guard in cip_xpanel.py could go stale without anyone noticing. cip_xpanel is
+# stdlib-only, so this adds no tap or pyserial dependency to a script whose
+# whole point is needing neither.
+from cip_xpanel import AADS_HOST as HOST, PORT
 
 # 0x12 is the slot the live lighting bridge holds, as of 2026-09-22 when it moved
 # there from 0x13. Pressing an entry join there fights Home Assistant for the

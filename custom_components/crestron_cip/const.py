@@ -118,9 +118,20 @@ IDLE_RETURN_SECONDS = 5.0
 # here can stop the AADS program running its own entry logic. Full write-up in
 # the pdehlke/homeassistant repo at
 # docs/crestron/crestron-subsystem-time-slicing.md.
+# The AADS moved from 192.168.4.61 to 192.168.4.65 on 2026-09-23. Its DHCP lease
+# was not reserved, so it renewed onto a new address overnight and the bridge's
+# CIP connect began failing with EHOSTUNREACH. Every AADS-backed load and all six
+# audio zones went dead while the three MC2E Kitchen loads kept working, because
+# they are a separate connection to a separate processor. pde reserved .65 to the
+# AADS's MAC the same morning, so this address is now fixed.
+#
+# Note what this outage did NOT touch: the slot. The bridge still registers as
+# IP-ID 0x12, and the alarm-write guard keys on the link name rather than the
+# host (see bridge.py), so neither was involved. The symptom looked like a slot
+# regression and was not.
 DEFAULTS = {
     LINK_AADS: {
-        "host": "192.168.4.61",
+        "host": "192.168.4.65",
         "ipid": 0x12,
         "subsystems": ENTRY_JOINS,
         "default_subsystem": SUBSYSTEM_LIGHTS,

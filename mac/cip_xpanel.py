@@ -18,7 +18,11 @@ HOST, PORT, IPID = "192.168.4.59", 41794, 0x03
 # keypad digits, Arm ToHome, and Fire/Medical/Panic, and d93 enters the alarm
 # subsystem from the home page. Mirrors FORBIDDEN_AADS_WRITE in the shipped
 # integration, custom_components/crestron_cip/const.py.
-AADS_HOST = "192.168.4.61"
+# Must track the AADS's real address or refuse_forbidden() below silently stops
+# matching and the DSC alarm guard becomes a no-op. It moved .61 -> .65 on
+# 2026-09-23 when an unreserved DHCP lease renewed; .65 is now reserved to its
+# MAC. This is the canonical copy: scripts import it rather than restating it.
+AADS_HOST = "192.168.4.65"
 FORBIDDEN_AADS_WRITE = frozenset(range(130, 149)) | {93}
 
 
