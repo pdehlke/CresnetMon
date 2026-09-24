@@ -1336,6 +1336,225 @@ def test_a_press_cancelled_by_a_close_still_releases_the_join():
     asyncio.run(scenario())
 
 
+# ---- the connection loop --------------------------------------------------
+#
+# Everything above drives a client whose socket is already up. This section is
+# about the session boundary itself: what a new session must forget, and how
+# hard the loop leans on a processor that will not take it.
+
+
+class _FakeReader:
+    """A socket that hands over scripted chunks and then reports EOF.
+
+    Returning b"" with at_eof() true is how _session() learns the processor
+    hung up, and it is the only way out of the read loop that does not depend
+    on the 1s read timeout, so a test that scripts nothing ends a session at
+    once rather than a second later.
+    """
+
+    def __init__(self, chunks=()):
+        self._chunks = list(chunks)
+        self._eof = False
+
+    async def read(self, _size):
+        if self._chunks:
+            return self._chunks.pop(0)
+        self._eof = True
+        return b""
+
+    def at_eof(self):
+        return self._eof
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.written = bytearray()
+        self.closed = False
+
+    def write(self, data):
+        self.written += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        pass
+
+
+def _connects_to(monkeypatch, reader, writer):
+    async def fake_open(host, port):
+        return reader, writer
+
+    monkeypatch.setattr(_cip_mod.asyncio, "open_connection", fake_open)
+
+
+def test_a_new_session_keeps_nothing_from_the_dead_one(monkeypatch):
+    """State from a dead session is not evidence about the live one.
+
+    Anything that changed while the link was away arrives in the new dump, and
+    anything that did not is re-asserted by it, so carrying the old buckets
+    forward can only ever preserve a value the processor has since contradicted.
+
+    The analog clear is the load-bearing half. `serial` deliberately survives,
+    and s11 naming a zone is one of the two conditions `_async_point_at` waits
+    on, so a stale s11 could confirm a cursor move that never happened. It
+    cannot, because the same check also requires a11 to be present in the A/V
+    bucket, and that bucket is emptied here.
+    """
+    client = _client()
+    client.digital_for(const.SUBSYSTEM_LIGHTS)[101] = 1
+    client.analog_for(const.SUBSYSTEM_AV)[const.VOLUME_ANALOG] = 52000
+    client.synced = True
+    client.current_subsystem = const.SUBSYSTEM_LIGHTS
+    before = client.generation
+    _connects_to(monkeypatch, _FakeReader(), _FakeWriter())
+
+    async def scenario():
+        client._running = True
+        with pytest.raises(OSError, match="closed the connection"):
+            await client._session()
+
+    asyncio.run(scenario())
+
+    assert client.digital_for(const.SUBSYSTEM_LIGHTS) == {}
+    assert client.analog_for(const.SUBSYSTEM_AV) == {}
+    assert client.synced is False
+    assert client.current_subsystem is None
+    # The A/V cursor cache is keyed on this and on nothing else, because no
+    # physical panel can move our slot's cursor: it is exact for one session
+    # and meaningless across two.
+    assert client.generation == before + 1
+
+
+def test_the_reconnect_backoff_escalates_and_pins_at_the_last_step(monkeypatch):
+    """A processor that will not take us must not be hammered.
+
+    It also never steps back down. `_run()` resets `attempt` after a session
+    that returns without raising, which reads as "a session that worked clears
+    the escalation", but `_session()` has exactly one exit that is not its
+    `while self._running` condition going false and that exit raises. So a
+    normal return means shutdown, and the statement after the reset is
+    `if not self._running: return`. The escalation is monotonic for the life of
+    the process: five drops pin it at the last step no matter how long the
+    sessions in between lasted. Asserted as it behaves, not as it reads.
+    """
+    client = _client()
+    monkeypatch.setattr(_cip_mod, "RECONNECT_BACKOFF", (1.0, 2.0, 5.0))
+    delays = []
+
+    async def dead_session():
+        # Every real session ends this way. A drop after an hour and a drop
+        # after a second are indistinguishable from _run()'s side.
+        raise OSError("processor closed the connection")
+
+    real_sleep = asyncio.sleep
+
+    async def record(delay):
+        delays.append(delay)
+        if len(delays) == 5:
+            client._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(client, "_session", dead_session)
+    monkeypatch.setattr(_cip_mod.asyncio, "sleep", record)
+
+    async def scenario():
+        client._running = True
+        await client._run()
+
+    asyncio.run(scenario())
+    assert delays == [1.0, 2.0, 5.0, 5.0, 5.0]
+
+
+def test_an_unexpected_failure_reconnects_rather_than_killing_the_link(monkeypatch):
+    """The bare `except Exception` is deliberate: a bug must not take the link down.
+
+    A link whose task has died looks exactly like a quiet house from the
+    outside, which is the failure mode this project has already had once.
+    """
+    client = _client()
+    monkeypatch.setattr(_cip_mod, "RECONNECT_BACKOFF", (1.0,))
+    attempts = []
+
+    async def buggy_session():
+        attempts.append(1)
+        raise ValueError("a bug, not a network problem")
+
+    real_sleep = asyncio.sleep
+
+    async def record(_delay):
+        if len(attempts) == 3:
+            client._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(client, "_session", buggy_session)
+    monkeypatch.setattr(_cip_mod.asyncio, "sleep", record)
+
+    async def scenario():
+        client._running = True
+        await client._run()
+
+    asyncio.run(scenario())
+    assert len(attempts) == 3, "an unexpected exception ended the connection loop"
+
+
+def test_a_bring_up_that_answered_nothing_does_not_retry_straight_away(monkeypatch):
+    """The rate limit exists because a failed entry is itself quiet.
+
+    `_start_bring_up()` fires whenever the link has been silent for
+    SYNC_QUIET_SECONDS and is not yet synced. An entry the processor ignores
+    produces no traffic at all, so it satisfies that condition the instant it
+    gives up, and without the gate the link would spin on entry attempts for as
+    long as the processor stayed deaf. Every other test here calls `_bring_up()`
+    directly and so never reaches the gate.
+    """
+    client = _client()
+    monkeypatch.setattr(_cip_mod, "BRINGUP_RETRY_SECONDS", 0.5)
+    # No dump registered for the entry join: the processor takes the press and
+    # says nothing, which is the 2026-09-15 failure.
+    runs = []
+    real_bring_up = client._bring_up
+
+    async def counted():
+        runs.append(1)
+        await real_bring_up()
+
+    client._bring_up = counted
+
+    async def scenario():
+        client._start_bring_up()
+        assert client._bringup is not None
+        await client._bringup
+        assert client.synced is False, "an entry that answered nothing reported success"
+
+        client._start_bring_up()
+        assert client._bringup is None, "retried inside the rate limit"
+
+        await asyncio.sleep(0.4)
+        client._start_bring_up()
+        assert client._bringup is not None, "never retried after the rate limit expired"
+        await client._bringup
+
+    asyncio.run(scenario())
+    assert len(runs) == 2
+
+
+def test_a_synced_link_does_not_bring_itself_up_again(monkeypatch):
+    """The rate limit is the second gate, not the first."""
+    client = _client()
+    monkeypatch.setattr(_cip_mod, "BRINGUP_RETRY_SECONDS", 0.0)
+    client.synced = True
+
+    async def scenario():
+        client._start_bring_up()
+        assert client._bringup is None
+
+    asyncio.run(scenario())
+
+
 # ---- A/V zones ------------------------------------------------------------
 #
 # Six audio zones behind one per-slot cursor. Only the cursor's zone is
@@ -1383,6 +1602,10 @@ class FakeAvClient:
         self.volumes = dict.fromkeys(ZONE_KEYS, 0)
         # a11 and s11 do not arrive together on real hardware.
         self.volume_arrives_after = 0.0
+        # How long a cursor move leaves the per-zone joins blank. 0 keeps the
+        # repopulate synchronous, which is what every test written before the
+        # window was modelled assumes. ~0.06 is the measured live figure.
+        self.blank_seconds = 0.0
         self.sources: dict[str, int | None] = dict.fromkeys(ZONE_KEYS, None)
         self.cursor: str | None = None
 
@@ -1407,12 +1630,39 @@ class FakeAvClient:
         cursor goes. Modelling that difference is the point, because conflating
         them had every zone reporting whatever Studio was playing.
         """
+        self._publish_sources()
+        self._publish_volume()
+
+    def _publish_sources(self):
         av = self.digital_for(const.SUBSYSTEM_AV)
         for source in const.AV_SOURCES:
             av[const.source_press_join(source)] = 0
         source = self.sources[self.cursor]
         if source:
             av[const.source_press_join(source)] = 1
+
+    def _repoint(self):
+        """Move the cursor, blanking the per-zone joins the way the AADS does.
+
+        A cursor move drops d51-d56 to 0 and brings them back about 60ms later.
+        Only the digitals blank: a11 carries on describing the zone it already
+        described, which is why `async_set_volume` may not clear it and why the
+        analog side is modelled by `volume_arrives_after` instead.
+
+        The live blank also covers d41, d43 and d47. Nothing reads those, here
+        or in the controller, so they are left out rather than invented.
+        """
+        av = self.digital_for(const.SUBSYSTEM_AV)
+        for source in const.AV_SOURCES:
+            av[const.source_press_join(source)] = 0
+        if self.blank_seconds:
+            zone = self.cursor
+            asyncio.get_running_loop().call_later(
+                self.blank_seconds,
+                lambda: self._publish_sources() if self.cursor == zone else None,
+            )
+        else:
+            self._publish_sources()
         self._publish_volume()
 
     def _publish_page(self, source):
@@ -1445,7 +1695,7 @@ class FakeAvClient:
             if join == zone.select_join:
                 self.cursor = zone.key
                 self.serial[const.ZONE_NAME_SERIAL] = zone.name
-                self._publish()
+                self._repoint()
                 return
 
         if self.cursor is None:
@@ -1477,10 +1727,13 @@ class FakeAvClient:
 ZONE_KEYS = [zone.key for zone in const.ZONES]
 
 
-def make_av():
-    client = FakeAvClient()
+def _av_with(client):
     link = Link(const.LINK_AADS, client)
     return client, AvController(link), link.lock
+
+
+def make_av():
+    return _av_with(FakeAvClient())
 
 
 def test_the_zone_table_matches_the_mapped_joins():
@@ -1551,6 +1804,25 @@ def test_a_new_session_invalidates_the_cached_cursor():
         assert client.presses == [(955, 0.12), (955, 0.12)]
 
     asyncio.run(scenario())
+
+
+def test_the_cursor_cache_cannot_outlive_the_session_that_earned_it(monkeypatch):
+    """The generation bump is what makes a cached cursor safe to trust at all."""
+    client = _client()
+    _connects_to(monkeypatch, _FakeReader(), _FakeWriter())
+    av = AvController(Link(const.LINK_AADS, client))
+    av._cursor = "studio"
+    av._cursor_generation = client.generation
+
+    async def scenario():
+        client._running = True
+        with pytest.raises(OSError):
+            await client._session()
+
+    asyncio.run(scenario())
+    assert av._cursor_generation != client.generation, (
+        "a cursor cached in a dead session would be taken as current"
+    )
 
 
 def test_selecting_a_source_powers_the_zone_on_and_resets_its_volume():
@@ -1711,6 +1983,34 @@ def test_a_read_waits_for_the_volume_to_arrive_after_a_cursor_move():
     assert result["volume"] == 58982, "read the zone before its level had arrived"
 
 
+def test_a_read_across_the_cursor_blank_does_not_report_a_playing_zone_off(monkeypatch):
+    """The 60ms blank is a hazard, not a timing margin, and CURSOR_SETTLE_SECONDS is the guard.
+
+    A cursor move drops d51-d56 to 0 before the processor repopulates them, and
+    `_selected_source()` reads exactly those joins. A read that lands inside the
+    window finds nothing high, concludes no source, and reports a zone that is
+    playing as powered off. It is the same silent-by-construction failure as the
+    2026-09-15 lighting outage: wrong, and stated with complete confidence.
+
+    Nothing else in the path covers the window. The confirm loop's own exit only
+    needs s11 to name the zone and the processor to have spoken about the
+    analogs, and both are true from the instant of the press, so without the
+    sleep the loop returns on its first iteration with the joins still blank.
+    """
+    # 0.15 against a 0.05 blank, rather than the fixture's 0.01, so the sleep is
+    # the only thing standing between the press and the read.
+    monkeypatch.setattr(_av_mod, "CURSOR_SETTLE_SECONDS", 0.15)
+    client, av, _ = make_av()
+    client.blank_seconds = 0.05
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 52000
+
+    result = asyncio.run(av.async_status("studio"))
+    assert result["source"] == 2, "read the zone inside the blank window"
+    assert result["powered"] is True
+    assert result["volume"] == 52000
+
+
 def test_volume_refuses_to_ramp_when_the_zone_reports_no_level():
     """Reading inside the 60ms cursor blank reports a dead zone confidently."""
     client, av, _ = make_av()
@@ -1728,6 +2028,43 @@ def test_volume_outside_the_scale_is_refused():
     _, av, _ = make_av()
     with pytest.raises(CrestronError, match="outside 0-100"):
         asyncio.run(av.async_set_volume("studio", 120))
+
+
+class StalledVolumeClient(FakeAvClient):
+    """A zone whose level does not answer the ramp.
+
+    The only control is a hold and the only readback is a11, so the loop is open
+    loop with a correction: it presses, re-reads, and presses again until the
+    delta is inside tolerance. A level that never moves is the one input that
+    makes that run forever, and it is not exotic. a11 resets to zero on a
+    processor reboot, and a zone powered off on Tuner 1 was seen dropping to
+    zero on its own.
+    """
+
+    async def async_press(self, join, subsystem, hold=0.12):
+        if join in (const.VOLUME_UP_JOIN, const.VOLUME_DOWN_JOIN):
+            assert subsystem == self.current_subsystem, "pressed in the wrong subsystem"
+            self.presses.append((join, round(hold, 3)))
+            return
+        await super().async_press(join, subsystem, hold=hold)
+
+
+def test_a_volume_that_never_moves_gives_up_instead_of_ramping_forever():
+    """VOLUME_MAX_SEGMENTS is the only thing bounding the correction loop."""
+    client, av, _ = _av_with(StalledVolumeClient())
+    client.sources["studio"] = 2
+    client.volumes["studio"] = 0
+
+    # Matched against the constant rather than a literal 12: the cap is a safety
+    # bound someone may reasonably retune, unlike the measured entry thresholds
+    # this file pins on purpose elsewhere.
+    expected = f"volume stalled at 0 after {const.VOLUME_MAX_SEGMENTS} segments"
+    with pytest.raises(CrestronError, match=expected):
+        asyncio.run(av.async_set_volume("studio", 90))
+
+    ramps = [j for j, _ in client.presses if j in (const.VOLUME_UP_JOIN, const.VOLUME_DOWN_JOIN)]
+    assert len(ramps) == const.VOLUME_MAX_SEGMENTS, "the segment cap did not bound the loop"
+    assert set(ramps) == {const.VOLUME_UP_JOIN}, "ramped the wrong way against a static level"
 
 
 def test_powering_a_zone_off_clears_its_source():
@@ -1802,8 +2139,11 @@ class UnconfirmedCursorClient(FakeAvClient):
     press alone is right. Believing it afterwards is not.
     """
 
-    def _publish(self):
-        super()._publish()
+    def _repoint(self):
+        # Hooks the cursor move, not _publish: s11 is written by async_press as
+        # part of moving the cursor, and that is the only claim this client is
+        # making. A volume or source press republishes without touching it.
+        super()._repoint()
         self.serial[const.ZONE_NAME_SERIAL] = "Somewhere Else"
 
 
