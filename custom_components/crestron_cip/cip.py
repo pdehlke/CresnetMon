@@ -232,9 +232,17 @@ class CipClient:
     async def _run(self) -> None:
         attempt = 0
         while self._running:
+            # Captured in the finally because _close() clears it, and read after
+            # it because the escalation is about the next attempt, not this one.
+            # This used to be `attempt = 0` on a clean return from _session(),
+            # which could never fire: _session()'s only exit that is not its own
+            # `while self._running` test going false is a raise, so a clean
+            # return meant shutdown and the next statement returned. The
+            # backoff therefore climbed for the life of the process and pinned
+            # at the last step, however healthy the sessions in between were.
+            reached_sync = False
             try:
                 await self._session()
-                attempt = 0
             except asyncio.CancelledError:
                 raise
             except (OSError, asyncio.IncompleteReadError) as err:
@@ -242,12 +250,20 @@ class CipClient:
             except Exception:
                 _LOGGER.exception("%s: unexpected failure in CIP session", self.name)
             finally:
+                reached_sync = self.synced
                 await self._close()
                 if self._on_state:
                     self._on_state()
 
             if not self._running:
                 return
+            # Syncing is a high bar and cannot be cleared by a flapping link: it
+            # takes a registration dump, a quiet window, an entry press and that
+            # subsystem's own dump, several seconds of two-way traffic. A link
+            # that got that far and then dropped is not the same thing as a
+            # processor refusing us, so it starts again from the top.
+            if reached_sync:
+                attempt = 0
             delay = RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)]
             attempt += 1
             _LOGGER.debug("%s: reconnecting in %.0fs", self.name, delay)

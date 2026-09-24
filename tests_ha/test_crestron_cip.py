@@ -1432,14 +1432,9 @@ def test_a_new_session_keeps_nothing_from_the_dead_one(monkeypatch):
 def test_the_reconnect_backoff_escalates_and_pins_at_the_last_step(monkeypatch):
     """A processor that will not take us must not be hammered.
 
-    It also never steps back down. `_run()` resets `attempt` after a session
-    that returns without raising, which reads as "a session that worked clears
-    the escalation", but `_session()` has exactly one exit that is not its
-    `while self._running` condition going false and that exit raises. So a
-    normal return means shutdown, and the statement after the reset is
-    `if not self._running: return`. The escalation is monotonic for the life of
-    the process: five drops pin it at the last step no matter how long the
-    sessions in between lasted. Asserted as it behaves, not as it reads.
+    This is the link that never gets anywhere: it connects, or fails to, and
+    never reaches synced. The escalation climbs to the last step and stays
+    there, which is the whole point of the table.
     """
     client = _client()
     monkeypatch.setattr(_cip_mod, "RECONNECT_BACKOFF", (1.0, 2.0, 5.0))
@@ -1467,6 +1462,52 @@ def test_the_reconnect_backoff_escalates_and_pins_at_the_last_step(monkeypatch):
 
     asyncio.run(scenario())
     assert delays == [1.0, 2.0, 5.0, 5.0, 5.0]
+
+
+def test_a_session_that_synced_starts_the_escalation_again(monkeypatch):
+    """A link that worked and then dropped is not a processor refusing us.
+
+    Without this the escalation is monotonic for the life of the process, so a
+    link that drops five times over a week waits 30s to come back from the
+    sixth even though every session in between ran for days. The reset used to
+    be written as `attempt = 0` on a clean return from `_session()`, which could
+    not fire, because the only way `_session()` returns without raising is
+    `self._running` going false and the very next statement returns on that.
+
+    `synced` is the bar rather than "the session returned", and it is captured
+    before `_close()` because `_close()` clears it.
+    """
+    client = _client()
+    monkeypatch.setattr(_cip_mod, "RECONNECT_BACKOFF", (1.0, 2.0, 5.0))
+    delays = []
+    sessions = 0
+
+    async def session():
+        nonlocal sessions
+        sessions += 1
+        # The third one gets far enough to be useful before the link drops.
+        client.synced = sessions == 3
+        raise OSError("processor closed the connection")
+
+    real_sleep = asyncio.sleep
+
+    async def record(delay):
+        delays.append(delay)
+        if len(delays) == 4:
+            client._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(client, "_session", session)
+    monkeypatch.setattr(_cip_mod.asyncio, "sleep", record)
+
+    async def scenario():
+        client._running = True
+        await client._run()
+
+    asyncio.run(scenario())
+    # Climbs, drops back to the top of the table after the session that synced,
+    # then climbs again.
+    assert delays == [1.0, 2.0, 1.0, 2.0]
 
 
 def test_an_unexpected_failure_reconnects_rather_than_killing_the_link(monkeypatch):
