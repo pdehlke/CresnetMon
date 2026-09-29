@@ -2211,3 +2211,477 @@ def test_an_unconfirmed_cursor_move_is_not_cached_as_confirmed():
     first, second = asyncio.run(scenario())
     assert first >= 1
     assert second > first, "an unconfirmed cursor was cached and never re-pressed"
+
+
+# ---- the zone state cache --------------------------------------------------
+#
+# Everything below this line is about the four entity platforms added on
+# 2026-09-29 and the AvController surface they read. The entities themselves are
+# exercised for real, against stubbed Home Assistant base classes, rather than
+# asserted on as source text: a test that greps a property body proves the
+# property was spelled a certain way and nothing about what it returns.
+
+
+def test_every_read_files_the_zone_state_and_when_it_was_read():
+    """_snapshot is the funnel, so no operation can read a zone and not file it."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        assert av.state("studio") is None
+        assert av.read_at("studio") is None
+        await av.async_select_source("studio", 2)
+        return av.state("studio"), av.read_at("studio")
+
+    state, read_at = asyncio.run(scenario())
+    assert state is not None and state["zone"] == "studio"
+    assert state["powered"] is True
+    assert read_at is not None
+
+
+def test_powering_every_zone_off_forgets_every_zone():
+    """d40 moves six zones and reads none, so six cached states are now guesses.
+
+    Left in place they would show six rooms playing after all six were switched
+    off, which is the one failure this cache can produce that looks like working
+    hardware.
+    """
+    client, av, _ = make_av()
+
+    async def scenario():
+        for zone in const.ZONES:
+            await av.async_select_source(zone.key, 2)
+        before = [av.state(z.key) is not None for z in const.ZONES]
+        await av.async_power_off_all()
+        after = [av.state(z.key) is not None for z in const.ZONES]
+        return before, after
+
+    before, after = asyncio.run(scenario())
+    assert all(before)
+    assert not any(after), "power_off_all left stale per-zone state behind"
+
+
+def test_page_staleness_is_none_until_every_zone_has_been_read():
+    """A half-blank dashboard does not get to describe itself as fresh."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        partial = []
+        for zone in const.ZONES[:-1]:
+            await av.async_status(zone.key)
+            partial.append(av.oldest_read_at())
+        await av.async_status(const.ZONES[-1].key)
+        return partial, av.oldest_read_at()
+
+    partial, complete = asyncio.run(scenario())
+    assert all(p is None for p in partial), "reported an oldest read while zones were unread"
+    assert complete is not None
+    assert complete == min(av.read_at(z.key) for z in const.ZONES)
+
+
+def test_a_subscriber_hears_every_read():
+    client, av, _ = make_av()
+    heard = []
+
+    async def scenario():
+        remove = av.subscribe(lambda: heard.append(1))
+        await av.async_status("kitchen")
+        after_one = len(heard)
+        remove()
+        await av.async_status("studio")
+        return after_one, len(heard)
+
+    after_one, after_remove = asyncio.run(scenario())
+    assert after_one >= 1, "a read published nothing, so entities would never redraw"
+    assert after_remove == after_one, "unsubscribe did not take"
+
+
+# ---- turning a room on -----------------------------------------------------
+
+
+def test_turning_a_room_on_uses_that_rooms_own_level():
+    """Kitchen means 80 and Studio means 90, wherever "on" is pressed from."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_turn_on("kitchen")
+        await av.async_turn_on("studio")
+        return av.state("kitchen"), av.state("studio")
+
+    kitchen, studio = asyncio.run(scenario())
+    assert kitchen["source"] == const.AV_DEFAULT_SOURCE
+    assert studio["source"] == const.AV_DEFAULT_SOURCE
+    assert abs(kitchen["volume_percent"] - 80.0) <= 2.0, kitchen["volume_percent"]
+    assert abs(studio["volume_percent"] - 90.0) <= 2.0, studio["volume_percent"]
+
+
+def test_turning_on_a_room_already_on_still_sets_its_level():
+    """A room left at 40% by a wall panel is on, and pressing on must fix it.
+
+    Skipping the ramp when the source is already selected would make the button
+    a no-op on exactly the room that most needs it, and the press itself is
+    skipped inside async_select_source anyway, so there is nothing to save.
+    """
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_select_source("studio", 2)
+        client.volumes["studio"] = _av_mod.percent_to_raw(40.0)
+        client._publish_volume()
+        await av.async_turn_on("studio")
+        return av.state("studio")
+
+    state = asyncio.run(scenario())
+    assert abs(state["volume_percent"] - 90.0) <= 2.0, state["volume_percent"]
+
+
+# ---- changing source without losing the level ------------------------------
+
+
+def test_a_source_change_puts_the_level_back():
+    """Tuner 1's preset is 40%, which on these speakers is silence.
+
+    FakeAvClient.PRESETS carries the measured 26214 for source 5, so this is the
+    real number rather than an invented one.
+    """
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_turn_on("courtyard")
+        before = av.state("courtyard")["volume_percent"]
+        await av.async_select_source_keeping_volume("courtyard", 5)
+        return before, av.state("courtyard")
+
+    before, after = asyncio.run(scenario())
+    assert abs(before - 90.0) <= 2.0
+    assert after["source"] == 5
+    assert abs(after["volume_percent"] - before) <= 2.0, (
+        f"a source change dropped the room from {before}% to {after['volume_percent']}%"
+    )
+
+
+def test_a_source_change_on_an_off_room_lands_on_that_rooms_on_level():
+    """An off room has no level worth preserving, so it gets the one "on" means."""
+    client, av, _ = make_av()
+
+    async def scenario():
+        await av.async_status("kitchen")
+        assert av.state("kitchen")["powered"] is False
+        await av.async_select_source_keeping_volume("kitchen", 5)
+        return av.state("kitchen")
+
+    state = asyncio.run(scenario())
+    assert state["source"] == 5
+    assert abs(state["volume_percent"] - 80.0) <= 2.0, state["volume_percent"]
+
+
+# ---- the all-six walk ------------------------------------------------------
+
+
+class OneFailingZoneClient(FakeAvClient):
+    """A client whose write fails on the wire for one zone's select join.
+
+    Not a silently-swallowed press: _async_point_at proceeds on the press alone
+    when s11 never confirms, deliberately, because a serial that did not refresh
+    is weak evidence that the cursor did not move. A press that raises is the
+    failure a walk actually has to survive.
+    """
+
+    FAILS = "master_bath"
+
+    async def async_press(self, join, subsystem, hold=0.12):
+        if join == const.ZONES_BY_KEY[self.FAILS].select_join:
+            raise CrestronError("aads: write failed")
+        await super().async_press(join, subsystem, hold)
+
+
+def test_a_walk_that_loses_one_zone_still_reads_the_other_five():
+    """One unreachable room costs that room, not the other five.
+
+    A walk that aborts halfway leaves the dashboard half stale with no
+    indication of which half, which is worse than five good rooms and a gap.
+    """
+    client = OneFailingZoneClient()
+    av = AvController(Link(const.LINK_AADS, client))
+
+    asyncio.run(av.async_refresh_all())
+
+    read = {z.key for z in const.ZONES if av.state(z.key) is not None}
+    assert read == {z.key for z in const.ZONES} - {OneFailingZoneClient.FAILS}, read
+    assert av.oldest_read_at() is None, "claimed a complete read while one zone was never read"
+
+
+# ---- the entities ----------------------------------------------------------
+#
+# Stubs, not mocks: these stand in for Home Assistant base classes so the real
+# entity code runs. Anything the entities actually rely on (async_write_ha_state,
+# attribute assignment) is here; anything they do not touch is absent on purpose,
+# so a future entity that starts depending on real HA behaviour fails loudly
+# rather than passing against a stub that quietly allows it.
+
+
+def _install_ha_stubs():
+    if "homeassistant" in sys.modules:
+        return
+
+    def _mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        sys.modules[name] = module
+        return module
+
+    class _Entity:
+        """Stands in for HA's Entity and the four domain bases.
+
+        Carries the _attr_ fallback accessors the real bases define, because
+        those are the contract the entity classes are written against: setting
+        _attr_options and reading .options is HA's documented pattern, and a
+        stub without it would make a passing test prove only that a private
+        attribute exists.
+        """
+
+        _attr_should_poll = True
+        _attr_options = None
+        _attr_native_min_value = None
+        _attr_native_max_value = None
+        _attr_native_step = None
+        entity_id = None
+        hass = None
+
+        def async_write_ha_state(self):
+            pass
+
+        @property
+        def options(self):
+            return self._attr_options
+
+        @property
+        def native_min_value(self):
+            return self._attr_native_min_value
+
+        @property
+        def native_max_value(self):
+            return self._attr_native_max_value
+
+        @property
+        def native_step(self):
+            return self._attr_native_step
+
+    class _HomeAssistantError(Exception):
+        pass
+
+    class _NumberMode:
+        SLIDER = "slider"
+
+    class _Dt:
+        @staticmethod
+        def utc_from_timestamp(value):
+            import datetime
+
+            return datetime.datetime.fromtimestamp(value, datetime.UTC)
+
+    _mod("homeassistant")
+    _mod("homeassistant.core", HomeAssistant=object, callback=lambda fn: fn)
+    _mod("homeassistant.exceptions", HomeAssistantError=_HomeAssistantError)
+    _mod("homeassistant.const", PERCENTAGE="%")
+    _mod("homeassistant.util")
+    _mod("homeassistant.util.dt", utc_from_timestamp=_Dt.utc_from_timestamp)
+    sys.modules["homeassistant.util"].dt = sys.modules["homeassistant.util.dt"]
+    _mod("homeassistant.helpers")
+    _mod("homeassistant.helpers.entity", Entity=_Entity)
+    _mod("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
+    _mod("homeassistant.helpers.typing", ConfigType=dict, DiscoveryInfoType=dict)
+    _mod("homeassistant.components")
+    _mod("homeassistant.components.switch", SwitchEntity=_Entity)
+    _mod("homeassistant.components.select", SelectEntity=_Entity)
+    _mod("homeassistant.components.number", NumberEntity=_Entity, NumberMode=_NumberMode)
+    _mod("homeassistant.components.button", ButtonEntity=_Entity)
+
+
+class FakeBridge:
+    """Just enough bridge for an entity: the AV controller and link health."""
+
+    def __init__(self, av, connected=True):
+        self.av = av
+        self._connected = connected
+
+    def link_connected(self, link):
+        return self._connected
+
+
+def _entities(client=None):
+    _install_ha_stubs()
+    client = client or FakeAvClient()
+    av = AvController(Link(const.LINK_AADS, client))
+    bridge = FakeBridge(av)
+    switch_mod = importlib.import_module("crestron_cip.switch")
+    select_mod = importlib.import_module("crestron_cip.select")
+    number_mod = importlib.import_module("crestron_cip.number")
+    button_mod = importlib.import_module("crestron_cip.button")
+    return client, av, bridge, switch_mod, select_mod, number_mod, button_mod
+
+
+def test_volume_and_mute_are_unavailable_on_a_room_that_is_off():
+    """A powered-off zone has no source, so a level and a mute describe nothing.
+
+    Whether a11 can even be ramped in that state is untested on the hardware,
+    which is the actual reason not to offer the control.
+    """
+    client, av, bridge, switch_mod, _, number_mod, _ = _entities()
+    zone = const.ZONES_BY_KEY["studio"]
+    volume = number_mod.CrestronZoneVolume(bridge, zone)
+    mute = switch_mod.CrestronZoneMute(bridge, zone)
+
+    async def scenario():
+        await av.async_status("studio")
+        off = (volume.available, mute.available)
+        await av.async_turn_on("studio")
+        return off, (volume.available, mute.available)
+
+    off, on = asyncio.run(scenario())
+    assert off == (False, False), "offered volume and mute on a room that is off"
+    assert on == (True, True), "withheld volume and mute from a room that is on"
+
+
+def test_power_and_source_stay_available_on_a_room_that_is_off():
+    """These two are how an off or never-read room is acted on at all.
+
+    Gating them on having a cached state would mean a control you cannot press
+    until something presses it, which is the wrong answer to "we have not looked
+    yet" when pressing it is what would make us look.
+    """
+    client, av, bridge, switch_mod, select_mod, _, _ = _entities()
+    zone = const.ZONES_BY_KEY["kitchen"]
+    power = switch_mod.CrestronZonePower(bridge, zone)
+    source = select_mod.CrestronZoneSource(bridge, zone)
+
+    assert av.state("kitchen") is None
+    assert power.available is True
+    assert source.available is True
+    assert power.is_on is None, "claimed to know the state of a zone never read"
+    assert source.current_option is None
+
+    # And still available once the room has been read and is genuinely off,
+    # which is the case volume and mute deliberately withdraw on. Selecting a
+    # source is the only power-on this hardware has, so withdrawing it here
+    # would leave an off room with no way back on from this dashboard.
+    async def read_it_off():
+        await av.async_status("kitchen")
+
+    asyncio.run(read_it_off())
+    assert av.state("kitchen")["powered"] is False
+    assert power.available is True
+    assert source.available is True, "an off room lost the only control that can turn it on"
+    assert source.current_option is None, "named a source on a room with none selected"
+
+
+def test_a_down_link_takes_every_audio_control_with_it():
+    _install_ha_stubs()
+    client = FakeAvClient()
+    av = AvController(Link(const.LINK_AADS, client))
+    bridge = FakeBridge(av, connected=False)
+    switch_mod = importlib.import_module("crestron_cip.switch")
+    select_mod = importlib.import_module("crestron_cip.select")
+    number_mod = importlib.import_module("crestron_cip.number")
+    zone = const.ZONES_BY_KEY["courtyard"]
+
+    assert switch_mod.CrestronZonePower(bridge, zone).available is False
+    assert switch_mod.CrestronZoneMute(bridge, zone).available is False
+    assert select_mod.CrestronZoneSource(bridge, zone).available is False
+    assert number_mod.CrestronZoneVolume(bridge, zone).available is False
+
+
+def test_the_source_select_offers_pdes_names_and_presses_the_right_join():
+    client, av, bridge, _, select_mod, _, _ = _entities()
+    zone = const.ZONES_BY_KEY["master_bed"]
+    source = select_mod.CrestronZoneSource(bridge, zone)
+
+    assert source.options == ["iPod", "AirPlay", "BluRay", "Great Room", "Tuner 1", "Tuner 2"]
+
+    asyncio.run(source.async_select_option("BluRay"))
+    assert client.sources["master_bed"] == 3
+    assert source.current_option == "BluRay"
+
+
+def test_the_select_reports_the_per_source_serial_not_the_selected_source_serial():
+    """s16 is not refreshed reliably and will name the wrong subsystem.
+
+    Confirmed live on 2026-09-29: selecting Tuner 1 in Studio left s16 reading
+    'Lights', the lighting subsystem's own name, so an attribute wired to it
+    showed that as the room's source. s(100+N) is the per-source name serial and
+    is what s101/s102 were read from when iPod and AirPlay were identified.
+    """
+    client, av, bridge, _, select_mod, _, _ = _entities()
+    source = select_mod.CrestronZoneSource(bridge, const.ZONES_BY_KEY["studio"])
+
+    async def scenario():
+        await av.async_select_source("studio", 5)
+        # Exactly what the live slot did: the per-source serial names the
+        # source, while s16 still carries the subsystem the slot came from.
+        client.serial[const.source_name_serial(5)] = "Tuner 1"
+        client.serial[const.SOURCE_NAME_SERIAL] = "Lights"
+        await av.async_status("studio")
+        return source.extra_state_attributes
+
+    attrs = asyncio.run(scenario())
+    assert attrs["processor_source_name"] == "Tuner 1"
+    assert attrs["processor_source_name"] != "Lights", "wired to s16, which names the subsystem"
+
+
+def test_the_volume_entity_reports_below_its_own_floor_rather_than_clamping():
+    """A panel can leave a room at 40%. The number that says so is the useful one.
+
+    Reporting 70 because 70 is as low as the slider goes would be the control
+    lying about the room to flatter its own range.
+    """
+    client, av, bridge, _, _, number_mod, _ = _entities()
+    zone = const.ZONES_BY_KEY["outdoor_kitchen"]
+    volume = number_mod.CrestronZoneVolume(bridge, zone)
+
+    async def scenario():
+        await av.async_select_source("outdoor_kitchen", 5)
+        return volume.native_value
+
+    value = asyncio.run(scenario())
+    assert value is not None
+    assert value < const.VOLUME_SLIDER_MIN_PERCENT, value
+    assert abs(value - 40.0) <= 1.0, value
+
+
+def test_the_slider_span_is_the_top_of_the_range_in_fives():
+    client, av, bridge, _, _, number_mod, _ = _entities()
+    volume = number_mod.CrestronZoneVolume(bridge, const.ZONES_BY_KEY["studio"])
+    assert volume.native_min_value == 70.0
+    assert volume.native_max_value == 100.0
+    assert volume.native_step == 5.0
+    assert volume.native_min_value < const.VOLUME_AUDIBLE_FLOOR_PERCENT, (
+        "the audible floor is not reachable from inside the slider's own span"
+    )
+
+
+def test_the_refresh_button_publishes_page_level_staleness():
+    client, av, bridge, _, _, _, button_mod = _entities()
+    button = button_mod.CrestronAudioRefresh(bridge)
+
+    assert button.extra_state_attributes["oldest_read"] is None
+
+    asyncio.run(button.async_press())
+
+    assert {z.key for z in const.ZONES} == {z.key for z in const.ZONES if av.state(z.key)}
+    assert button.extra_state_attributes["oldest_read"] is not None
+
+
+def test_the_power_switch_turn_on_goes_through_the_zones_own_level():
+    """The switch must not carry its own idea of what on means."""
+    client, av, bridge, switch_mod, _, _, _ = _entities()
+    power = switch_mod.CrestronZonePower(bridge, const.ZONES_BY_KEY["kitchen"])
+
+    asyncio.run(power.async_turn_on())
+
+    assert client.sources["kitchen"] == const.AV_DEFAULT_SOURCE
+    assert abs(_av_mod.raw_to_percent(client.volumes["kitchen"]) - 80.0) <= 2.0
+    assert power.is_on is True
+
+    asyncio.run(power.async_turn_off())
+    assert client.sources["kitchen"] is None
+    assert power.is_on is False

@@ -16,6 +16,7 @@ is enough. Hosts and IP-IDs may be overridden per link if anything moves.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import voluptuous as vol
@@ -38,6 +39,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# How long the audio seed waits for the AADS session, and how long it then holds
+# off so lighting bring-up gets the slot first. See _seed_audio.
+SEED_LINK_TIMEOUT_SECONDS = 120.0
+SEED_DELAY_SECONDS = 15.0
 
 CONF_IPID = "ipid"
 ATTR_LOAD = "load"
@@ -162,10 +168,53 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             supports_response=SupportsResponse.OPTIONAL,
         )
 
-    hass.async_create_task(async_load_platform(hass, Platform.BINARY_SENSOR, DOMAIN, {}, config))
+    for platform in (
+        Platform.BINARY_SENSOR,
+        Platform.SWITCH,
+        Platform.SELECT,
+        Platform.NUMBER,
+        Platform.BUTTON,
+    ):
+        hass.async_create_task(async_load_platform(hass, platform, DOMAIN, {}, config))
+
+    hass.async_create_task(_seed_audio(hass, bridge))
 
     async def _stop(_event) -> None:
         await bridge.async_stop()
 
     hass.bus.async_listen_once("homeassistant_stop", _stop)
     return True
+
+
+async def _seed_audio(hass: HomeAssistant, bridge: CrestronBridge) -> None:
+    """Read all six audio zones once, so the dashboard is not blank on boot.
+
+    Nothing polls A/V state, by design, so without this every zone entity reads
+    unknown after every restart until somebody presses refresh. Restarts are
+    frequent here because the integration has no config flow and new code only
+    loads on one.
+
+    Waits for the AADS link to sync and then holds SEED_DELAY_SECONDS longer.
+    The wait is for correctness: a walk issued before the session is registered
+    just fails six times. The extra hold is for manners, because bring-up is
+    already spending the slot on a registration dump and an UPDATE_REQUEST, and
+    a six-zone A/V excursion on top of that delays the thing people actually
+    notice, which is the lights coming back.
+
+    Failures are logged and dropped. A seed is a convenience; nothing else waits
+    on it, and taking the integration down because the amp was unreachable at
+    boot would trade a blank dashboard for no lighting at all.
+    """
+    try:
+        deadline = asyncio.get_running_loop().time() + SEED_LINK_TIMEOUT_SECONDS
+        while not bridge.link_connected(LINK_AADS):
+            if asyncio.get_running_loop().time() > deadline:
+                _LOGGER.warning("audio seed skipped: the AADS link never came up")
+                return
+            await asyncio.sleep(1.0)
+        await asyncio.sleep(SEED_DELAY_SECONDS)
+        await bridge.av.async_refresh_all()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a convenience read must not take the bridge down
+        _LOGGER.exception("audio seed failed; zones stay unknown until a refresh")

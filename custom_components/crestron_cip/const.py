@@ -183,10 +183,17 @@ class Zone:
     key: str
     name: str
     select_join: int
+    on_volume: int = 90
 
 
 ZONES: tuple[Zone, ...] = (
-    Zone("kitchen", "Kitchen", 951),
+    # on_volume is what "turn this room on" means, because there is no power-on
+    # join: powering a zone on is selecting a source, and that overwrites the
+    # level with the AADS's own preset for that source. So a level has to be
+    # supplied, and it belongs next to the zone rather than in whichever caller
+    # happens to be turning the room on. The Kitchen sits at 80 on pde's ear;
+    # everywhere else wants 90.
+    Zone("kitchen", "Kitchen", 951, on_volume=80),
     Zone("outdoor_kitchen", "Outdoor Kitchen", 952),
     Zone("master_bed", "Master Bed", 953),
     Zone("master_bath", "Master Bath", 954),
@@ -201,6 +208,30 @@ ZONES_BY_KEY: dict[str, Zone] = {zone.key: zone for zone in ZONES}
 # wires d51-d56, so only those are reachable from this panel layout.
 AV_SOURCES = range(1, 7)
 AV_NO_SOURCE_JOIN = 1001
+
+# What each source actually is, per pde on 2026-09-29. The processor publishes
+# its own name on s(100+N) and s101/s102 were read live as iPod and AirPlay, but
+# reading the other four means selecting them in a real room, which is audible.
+# These are pde's names for them and they are what the select entity offers.
+#
+# Source 4 is the Integra's output wired into the AADS as one fixed line input,
+# which is why picking "Great Room" in another room mirrors whatever the Living
+# Room is playing. Crestron can move that feed around the house and cannot
+# change what it plays.
+AV_SOURCE_NAMES: dict[int, str] = {
+    1: "iPod",
+    2: "AirPlay",
+    3: "BluRay",
+    4: "Great Room",
+    5: "Tuner 1",
+    6: "Tuner 2",
+}
+AV_SOURCE_NUMBERS: dict[str, int] = {name: n for n, name in AV_SOURCE_NAMES.items()}
+
+# What a bare "turn the room on" selects. AirPlay is the one source whose
+# identity is confirmed from the processor's own s102 rather than from pde's
+# recollection, and it is what script.all_rooms_airplay has always used.
+AV_DEFAULT_SOURCE = 2
 
 
 def source_press_join(source: int) -> int:
@@ -248,6 +279,16 @@ VOLUME_MAX_SEGMENTS = 12
 # AirPlay. Anything under this is accepted and acted on, and warned about, since
 # asking for it is more likely a unit mix-up than an intention.
 VOLUME_AUDIBLE_FLOOR_PERCENT = 80.0
+
+# What the number entity's slider spans, which is deliberately not 0-100. The
+# services still accept the full range and always will, because the hardware
+# does; this is only the span a dragged slider offers. Below the audible floor
+# the travel is silence, and a control that spends four fifths of itself on
+# "off, but slowly" is worse than one that admits where the useful span is.
+# 70 rather than 80 so the floor itself is reachable and so is a little below it.
+VOLUME_SLIDER_MIN_PERCENT = 70.0
+VOLUME_SLIDER_MAX_PERCENT = 100.0
+VOLUME_SLIDER_STEP_PERCENT = 5.0
 
 # A cursor move blanks the per-zone joins for about 60ms before repopulating
 # them. Anything read inside that window reports a dead zone with full

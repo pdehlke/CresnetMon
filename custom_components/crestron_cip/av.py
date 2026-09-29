@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from .cip import CrestronError
 from .const import (
     ALL_ZONES_OFF_JOIN,
+    AV_DEFAULT_SOURCE,
     AV_NO_SOURCE_JOIN,
     AV_SOURCES,
     CURSOR_CONFIRM_TIMEOUT,
@@ -46,6 +49,7 @@ from .const import (
     VOLUME_UP_JOIN,
     ZONE_NAME_SERIAL,
     ZONE_POWER_OFF_JOIN,
+    ZONES,
     ZONES_BY_KEY,
     Zone,
     source_feedback_join,
@@ -85,6 +89,55 @@ class AvController:
         self._touch = link.touch
         self._cursor: str | None = None
         self._cursor_generation = -1
+        # Last known state per zone, and when it was read. Entities read this
+        # rather than the joins, because only the cursor's zone has live joins
+        # at any instant and bridge._on_digital deliberately drops every A/V
+        # digital before it reaches a listener: the A/V pages reuse join numbers
+        # that mean lighting loads in the other subsystem. So the snapshot is
+        # the only honest source for six zones at once.
+        self._state: dict[str, dict[str, object]] = {}
+        self._read_at: dict[str, float] = {}
+        self._subscribers: list[Callable[[], None]] = []
+
+    # ---- what the entities see ---------------------------------------------
+
+    def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Tell me when any zone's state moves. Returns the unsubscribe."""
+        self._subscribers.append(callback)
+
+        def _remove() -> None:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
+
+        return _remove
+
+    def _publish(self) -> None:
+        for callback in list(self._subscribers):
+            callback()
+
+    def state(self, zone_key: str) -> dict[str, object] | None:
+        """This zone's last known state, or None if it has never been read."""
+        return self._state.get(zone_key)
+
+    def read_at(self, zone_key: str) -> float | None:
+        return self._read_at.get(zone_key)
+
+    def oldest_read_at(self) -> float | None:
+        """When the least recently read zone was read, or None if any is unread.
+
+        None rather than "the oldest of the ones we have", because a page-level
+        staleness line that ignores the zones it knows nothing about would read
+        as fresh while half the dashboard was blank.
+        """
+        if len(self._read_at) < len(ZONES):
+            return None
+        return min(self._read_at.values())
+
+    def invalidate(self) -> None:
+        """Forget every zone's state, for a change that moved all six at once."""
+        self._state.clear()
+        self._read_at.clear()
+        self._publish()
 
     # ---- reading -----------------------------------------------------------
 
@@ -110,6 +163,20 @@ class AvController:
         return None
 
     def _snapshot(self, zone: Zone) -> dict[str, object]:
+        """Read the cursor's zone, and file the result as this zone's state.
+
+        Filing happens here rather than in each operation because every one of
+        them returns through this method, so there is no path that reads a zone
+        and forgets to record it. The one operation that changes a zone without
+        reading it is async_power_off_all, which invalidates all six instead.
+        """
+        snapshot = self._build_snapshot(zone)
+        self._state[zone.key] = snapshot
+        self._read_at[zone.key] = time.time()
+        self._publish()
+        return snapshot
+
+    def _build_snapshot(self, zone: Zone) -> dict[str, object]:
         source = self._selected_source()
         raw = self._client.analog_for(SUBSYSTEM_AV).get(VOLUME_ANALOG)
         return {
@@ -369,6 +436,11 @@ class AvController:
             # the finally because a press that reached the wire and then raised
             # changed them just the same.
             self._cursor = None
+            # Same reasoning one level up: six zones moved and no snapshot was
+            # taken, so every cached state is now a guess. Dropping them makes
+            # the entities go unknown, which is true, rather than leaving them
+            # showing six rooms as playing after they were all switched off.
+            self.invalidate()
 
     async def async_set_mute(self, zone_key: str, mute: bool) -> dict[str, object]:
         """Mute or unmute one zone. d48 is a toggle, so consult d46 first."""
@@ -378,3 +450,84 @@ class AvController:
             await self._client.async_press(MUTE_JOIN, SUBSYSTEM_AV)
             await asyncio.sleep(CURSOR_SETTLE_SECONDS)
             return self._snapshot(zone)
+
+    # ---- composite operations, for the entities ----------------------------
+    #
+    # These exist because a switch, a select and a number each have exactly one
+    # verb, and the hardware's verbs do not line up with them one to one.
+    # Turning a room on is two presses and a ramp; changing source is a press
+    # that silently moves the volume. Putting that here rather than in the
+    # entity classes keeps it testable without Home Assistant and keeps the four
+    # platforms from each growing their own version of it.
+
+    async def async_turn_on(self, zone_key: str) -> dict[str, object]:
+        """Power a room on: select the default source, then set its own level.
+
+        There is no power-on join, so "on" has to be a source, and selecting one
+        overwrites the level with that source's preset. The level therefore has
+        to be reapplied afterwards and it comes from the zone, not the caller,
+        so that every route into "on" agrees about what the Kitchen means.
+
+        Already-on is not a no-op that skips the volume: a room left at 40% by a
+        physical panel is on, and a user pressing on wants the room to sound the
+        way on sounds. The source press itself is skipped by
+        async_select_source when it is already there, so this costs a read and a
+        ramp rather than a re-press that would reset the level anyway.
+        """
+        zone = self._zone(zone_key)
+        await self.async_select_source(zone_key, AV_DEFAULT_SOURCE)
+        return await self.async_set_volume(zone_key, float(zone.on_volume))
+
+    async def async_select_source_keeping_volume(
+        self, zone_key: str, source: int
+    ) -> dict[str, object]:
+        """Change source without letting the source's preset move the volume.
+
+        Selecting a source replaces the level with the AADS's preset for it, and
+        those presets are not gentle: Tuner 1's measured at exactly 40%, which
+        on these speakers is silence. A source change that leaves the room
+        inaudible reads as broken hardware, so the level the room was already at
+        is put back afterwards.
+
+        A room that was off has no level worth preserving, so it lands on its
+        own on_volume instead, which is the same thing turning it on would have
+        given it.
+        """
+        zone = self._zone(zone_key)
+        before = self.state(zone_key)
+        was_on = bool(before and before.get("powered"))
+        previous = before.get("volume_percent") if before else None
+
+        after = await self.async_select_source(zone_key, source)
+        if after.get("source") != source:
+            return after
+
+        target = previous if (was_on and previous is not None) else float(zone.on_volume)
+        # Compared in raw units against the same tolerance async_set_volume
+        # converges to, so "close enough already" here means exactly what "done"
+        # means there. Comparing in percent with a hand-picked epsilon would be
+        # a second, disagreeing definition of the same thing.
+        landed = after.get("volume_percent")
+        if landed is not None and abs(percent_to_raw(float(landed)) - percent_to_raw(float(target))) <= VOLUME_TOLERANCE:
+            return after
+        return await self.async_set_volume(zone_key, float(target))
+
+    async def async_refresh(self, zone_key: str) -> dict[str, object]:
+        """Re-read one zone. Identical to async_status; named for what callers want."""
+        return await self.async_status(zone_key)
+
+    async def async_refresh_all(self) -> None:
+        """Walk the cursor across all six zones and file each one's state.
+
+        The slot is given back between zones by _slot(), so a lighting write
+        queued behind this waits for one zone rather than for the whole walk.
+        One unreachable zone costs that zone and not the other five, for the
+        same reason: this is what the caller asked for, and a walk that aborts
+        halfway leaves the dashboard half stale with no indication of which
+        half.
+        """
+        for zone in ZONES:
+            try:
+                await self.async_status(zone.key)
+            except CrestronError as err:
+                _LOGGER.warning("%s: could not read during refresh: %s", zone.key, err)
